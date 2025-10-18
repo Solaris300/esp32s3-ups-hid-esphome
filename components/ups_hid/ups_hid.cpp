@@ -20,19 +20,22 @@ void UpsHid::setup() {
   xTaskCreatePinnedToCore(UpsHid::host_daemon_task_, "usbh_daemon", 4096, nullptr, 5, nullptr, tskNO_AFFINITY);
 
   // 3) --- NUEVO: registrar un cliente para recibir eventos attach/detach ---
-  usb_host_client_config_t client_cfg = {
-      .is_synchronous = false,         // asíncrono (recibe mensajes en cola)
-      .max_num_event_msg = 8,          // cola de mensajes
-      .async = {.client_event_callback = nullptr, .callback_arg = nullptr}, // no usamos callback directo
-  };
-  err = usb_host_client_register(&client_cfg, &this->client_);
-  if (err == ESP_OK) {
-    ESP_LOGI(TAG, "USB Host client registered.");
-    xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client", 4096, this, 5, nullptr, tskNO_AFFINITY);
-  } else {
-    ESP_LOGE(TAG, "usb_host_client_register() failed: 0x%X", (unsigned)err);
-  }
+ usb_host_client_config_t client_cfg = {
+  .is_synchronous = false,
+  .max_num_event_msg = 8,
+  .async = {
+    .client_event_callback = UpsHid::client_callback_,
+    .callback_arg = this
+  },
+};
+err = usb_host_client_register(&client_cfg, &this->client_);
+if (err == ESP_OK) {
+  ESP_LOGI(TAG, "USB Host client registered.");
+  xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client", 4096, this, 5, nullptr, tskNO_AFFINITY);
+} else {
+  ESP_LOGE(TAG, "usb_host_client_register() failed: 0x%X", (unsigned)err);
 }
+
 
 void UpsHid::host_daemon_task_(void *arg) {
   uint32_t flags = 0;
@@ -52,39 +55,30 @@ void UpsHid::host_daemon_task_(void *arg) {
 // --- NUEVO: tarea que drena los mensajes del cliente y loguea attach/detach ---
 void UpsHid::client_task_(void *arg) {
   auto *self = static_cast<UpsHid *>(arg);
-  if (!self || !self->client_) {
-    ESP_LOGE(TAG, "[usbh_client] No client handle.");
-    vTaskDelete(nullptr);
-    return;
-  }
-
+  if (!self || !self->client_) { ESP_LOGE(TAG, "[usbh_client] No client handle."); vTaskDelete(nullptr); return; }
   while (true) {
-    // 1) Espera eventos en el cliente
     esp_err_t err = usb_host_client_handle_events(self->client_, pdMS_TO_TICKS(1000));
-    if (err == ESP_OK) {
-      // 2) Drena la cola de mensajes disponibles
-      usb_host_client_event_msg_t msg;
-      while (usb_host_client_get_event(self->client_, &msg) == ESP_OK) {
-        switch (msg.event) {
-          case USB_HOST_CLIENT_EVENT_NEW_DEV:
-            ESP_LOGI(TAG, "[attach] NEW_DEV");
-            break;
-          case USB_HOST_CLIENT_EVENT_DEV_GONE:
-            ESP_LOGI(TAG, "[detach] DEV_GONE");
-            break;
-          default:
-            ESP_LOGI(TAG, "[client] event=%d", (int) msg.event);
-            break;
-        }
-      }
-    } else if (err == ESP_ERR_TIMEOUT) {
-      // sin mensajes, normal
+    if (err == ESP_OK || err == ESP_ERR_TIMEOUT) {
+      // OK: el callback se ejecuta cuando haya eventos
     } else {
-      ESP_LOGW(TAG, "[usbh_client] usb_host_client_handle_events err=0x%X", (unsigned) err);
+      ESP_LOGW(TAG, "[usbh_client] handle_events err=0x%X", (unsigned)err);
     }
   }
 }
 
+void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg) {
+  switch (msg->event) {
+    case USB_HOST_CLIENT_EVENT_NEW_DEV:
+      ESP_LOGI(TAG, "[attach] NEW_DEV");
+      break;
+    case USB_HOST_CLIENT_EVENT_DEV_GONE:
+      ESP_LOGI(TAG, "[detach] DEV_GONE");
+      break;
+    default:
+      ESP_LOGI(TAG, "[client] event=%d", (int)msg->event);
+      break;
+  }
+}
 
 void UpsHid::dump_config() {
   ESP_LOGCONFIG(TAG, "UPS HID component is configured.");
