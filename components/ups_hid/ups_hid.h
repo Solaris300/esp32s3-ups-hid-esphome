@@ -5,15 +5,13 @@
 namespace esphome {
 namespace ups_hid {
 
-class UpsHid : public Component {
+class UpsHid : public PollingComponent {  // <-- PollingComponent
  public:
   void setup() override;
-  void loop() override;
   void dump_config() override;
-  float get_setup_priority() const override { return esphome::setup_priority::HARDWARE; }
-
+  void update() override;  // <-- en vez de loop()
  private:
-  bool hello_logged_{false};  // <-- NUEVO
+  bool hello_logged_{false};
 };
 
 }  // namespace ups_hid
