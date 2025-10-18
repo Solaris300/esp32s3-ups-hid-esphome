@@ -10,7 +10,7 @@ void UpsHid::setup() {
 }
 
 void UpsHid::dump_config() {
-  ESP_LOGCONFIG(TAG, "UPS HID component is configured.");  // <── NUEVO LOG de arranque
+  ESP_LOGCONFIG(TAG, "UPS HID component is configured.");
 }
 
 void UpsHid::loop() {
