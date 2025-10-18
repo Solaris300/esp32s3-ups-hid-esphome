@@ -18,6 +18,7 @@ class UpsHid : public PollingComponent {
   bool hello_logged_{false};
   static void host_daemon_task_(void *arg);
   static void client_task_(void *arg);
+  static void client_callback_(const usb_host_client_event_msg_t *event_msg, void *arg);
   usb_host_client_handle_t client_{nullptr};
 };
 
