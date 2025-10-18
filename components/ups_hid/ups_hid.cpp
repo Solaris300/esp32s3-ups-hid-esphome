@@ -1,91 +1,9 @@
 #include "ups_hid.h"
-#include "usb/usb_types_ch9.h"   // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
 
 namespace esphome {
 namespace ups_hid {
 
 static const char *const TAG = "ups_hid";
-
-// --- Callback obligatorio para transfers (IDF 5.4.x) ---
-static void ctrl_transfer_cb_(usb_transfer_t *transfer) {
-  // no-op
-}
-
-// --- PLAN B: GET_DESCRIPTOR(Device) por control transfer ---
-static bool read_device_descriptor_ctrl_(usb_host_client_handle_t client, usb_device_handle_t dev_handle) {
-  if (!client || !dev_handle) return false;
-
-  const int desc_len  = 18;
-  const int total_len = USB_SETUP_PACKET_SIZE + desc_len;
-
-  usb_transfer_t *xfer = nullptr;
-  if (usb_host_transfer_alloc(total_len, 0, &xfer) != ESP_OK) {
-    ESP_LOGE(TAG, "[dev] usb_host_transfer_alloc failed");
-    return false;
-  }
-
-  // Setup packet: GET_DESCRIPTOR(Device, index 0)
-  usb_setup_packet_t *setup = (usb_setup_packet_t *) xfer->data_buffer;
-  setup->bmRequestType = 0x80;                      // IN | Standard | Device
-  setup->bRequest      = 0x06;                      // GET_DESCRIPTOR
-  setup->wValue        = (uint16_t)((1 << 8) | 0);  // DEVICE(1)<<8 | 0
-  setup->wIndex        = 0;
-  setup->wLength       = desc_len;
-
-  xfer->num_bytes         = total_len;
-  xfer->callback          = ctrl_transfer_cb_;      // obligatorio
-  xfer->context           = nullptr;
-  xfer->device_handle     = dev_handle;             // obligatorio
-  xfer->bEndpointAddress  = 0x00;                   // EP0 (control)
-  xfer->flags             = 0;
-
-  ESP_LOGD(TAG, "[dev] ctrl submit: cb=%p dev=%p client=%p",
-           (void*) xfer->callback, (void*) dev_handle, (void*) client);
-
-  // Enviar control transfer (IDF 5.4.x usa client handle)
-  esp_err_t e = usb_host_transfer_submit_control(client, xfer);
-  if (e != ESP_OK) {
-    ESP_LOGE(TAG, "[dev] transfer_submit_control failed: 0x%X", (unsigned) e);
-    usb_host_transfer_free(xfer);
-    return false;
-  }
-
-  // Espera acotada a que el host complete
-  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
-  while (xTaskGetTickCount() < deadline) {
-    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED ||
-        xfer->status == USB_TRANSFER_STATUS_ERROR ||
-        xfer->status == USB_TRANSFER_STATUS_STALL ||
-        xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
-        xfer->status == USB_TRANSFER_STATUS_CANCELED) {
-      break;
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-
-  if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-    ESP_LOGW(TAG, "[dev] control transfer status=0x%X", (unsigned) xfer->status);
-    usb_host_transfer_free(xfer);
-    return false;
-  }
-
-  // Descriptor tras el setup (8 bytes)
-  const uint8_t *d = xfer->data_buffer + USB_SETUP_PACKET_SIZE;
-  if (d[0] < 18 || d[1] != 1) {
-    ESP_LOGW(TAG, "[dev] invalid device descriptor header: bLen=%u bType=%u", d[0], d[1]);
-    usb_host_transfer_free(xfer);
-    return false;
-  }
-
-  uint16_t vid = (uint16_t)(d[8]  | (d[9]  << 8));
-  uint16_t pid = (uint16_t)(d[10] | (d[11] << 8));
-  uint8_t  cls = d[4], subcls = d[5], proto = d[6];
-  ESP_LOGI(TAG, "[dev] VID=0x%04X PID=0x%04X class=0x%02X sub=0x%02X proto=0x%02X",
-           vid, pid, cls, subcls, proto);
-
-  usb_host_transfer_free(xfer);
-  return true;
-}
 
 // ---------- Métodos de la clase ----------
 
@@ -116,6 +34,7 @@ void UpsHid::setup() {
   err = usb_host_client_register(&client_cfg, &this->client_);
   if (err == ESP_OK) {
     ESP_LOGI(TAG, "USB Host client registered.");
+    // 4) Tarea que despacha eventos
     xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client",
                             4096, this, 5, nullptr, tskNO_AFFINITY);
   } else {
@@ -162,9 +81,10 @@ void UpsHid::client_task_(void *arg) {
     return;
   }
   while (true) {
-    // El callback se ejecuta cuando haya eventos
     esp_err_t err = usb_host_client_handle_events(self->client_, pdMS_TO_TICKS(1000));
-    if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+    if (err == ESP_OK || err == ESP_ERR_TIMEOUT) {
+      // OK / sin eventos
+    } else {
       ESP_LOGW(TAG, "[usbh_client] handle_events err=0x%X", (unsigned) err);
     }
   }
@@ -181,46 +101,12 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
       if (e == ESP_OK) {
         self->dev_addr_ = msg->new_dev.address;
         ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
-
-        // --- A) Ruta “cómoda” si existe en tu IDF
-#if ESP_IDF_VERSION_MAJOR >= 5
-  #ifdef usb_host_device_info
-        {
-          usb_host_device_info_t dinfo{};
-          esp_err_t ie = usb_host_device_info(self->dev_handle_, &dinfo);
-          if (ie == ESP_OK) {
-            const usb_device_desc_t *dd = &dinfo.dev_desc;
-            ESP_LOGI(TAG,
-                     "[dev] VID=0x%04X PID=0x%04X class=0x%02X sub=0x%02X proto=0x%02X speed=%s",
-                     dd->idVendor, dd->idProduct, dd->bDeviceClass, dd->bDeviceSubClass,
-                     dd->bDeviceProtocol,
-                     (dinfo.speed == USB_SPEED_LOW  ? "LOW"  :
-                      dinfo.speed == USB_SPEED_FULL ? "FULL" :
-                      dinfo.speed == USB_SPEED_HIGH ? "HIGH" : "UNKNOWN"));
-          } else {
-            ESP_LOGW(TAG, "[dev] usb_host_device_info() failed: 0x%X", (unsigned) ie);
-          }
-        }
-  #else
-        // --- B) Tu IDF 5.4.2: usar control transfer GET_DESCRIPTOR(Device)
-        if (!read_device_descriptor_ctrl_(self->client_, self->dev_handle_)) {
-          ESP_LOGW(TAG, "[dev] GET_DESCRIPTOR(Device) failed or timed out");
-        }
-  #endif
-#else
-        // IDF < 5: ruta de control transfer genérica
-        if (!read_device_descriptor_ctrl_(self->client_, self->dev_handle_)) {
-          ESP_LOGW(TAG, "[dev] GET_DESCRIPTOR(Device) failed or timed out");
-        }
-#endif
-
       } else {
         ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
                  (unsigned) msg->new_dev.address, (unsigned) e);
       }
       break;
     }
-
     case USB_HOST_CLIENT_EVENT_DEV_GONE: {
       if (self->dev_handle_ != nullptr) {
         usb_host_device_close(self->client_, self->dev_handle_);
@@ -230,7 +116,6 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
       ESP_LOGI(TAG, "[detach] DEV_GONE");
       break;
     }
-
     default:
       ESP_LOGI(TAG, "[client] event=%d", (int) msg->event);
       break;
