@@ -3,12 +3,9 @@
 #include "esphome/core/log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"         // <-- nuevo
 #include "usb/usb_host.h"
-#include "esp_idf_version.h"
-#include "usb/usb_types_ch9.h"     // usb_device_desc_t
-#if __has_include("usb/usb_types_stack.h")
-  #include "usb/usb_types_stack.h" // usb_host_device_info_t (IDF 5.x)
-#endif
+#include "usb/usb_types_ch9.h"       // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
 
 namespace esphome {
 namespace ups_hid {
@@ -21,13 +18,23 @@ class UpsHid : public PollingComponent {
 
  private:
   bool hello_logged_{false};
+
+  // Tareas / callback
   static void host_daemon_task_(void *arg);
   static void client_task_(void *arg);
-  static void client_callback_(const usb_host_client_event_msg_t *event_msg, void *arg);
-  usb_host_client_handle_t client_{nullptr};
+  static void client_callback_(const usb_host_client_event_msg_t *msg, void *arg);
 
+  // --- NUEVO: util para leer el device descriptor ---
+  bool read_device_descriptor_();
+
+  // Handles
+  usb_host_client_handle_t client_{nullptr};
   usb_device_handle_t dev_handle_{nullptr};
   uint8_t dev_addr_{0};
+
+  // --- NUEVO: control transfer síncrona con semáforo ---
+  usb_transfer_t *ctrl_xfer_{nullptr};
+  SemaphoreHandle_t ctrl_sem_{nullptr};
 };
 
 }  // namespace ups_hid
