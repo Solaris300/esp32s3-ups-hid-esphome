@@ -9,10 +9,13 @@ void UpsHid::setup() {
   ESP_LOGI(TAG, "UPS HID component started (hello from ESPHome external component).");
 }
 
+void UpsHid::dump_config() {
+  ESP_LOGCONFIG(TAG, "UPS HID component is configured.");  // <── NUEVO LOG de arranque
+}
+
 void UpsHid::loop() {
-  // Aquí más adelante gestionaremos eventos del USB Host y publicaremos sensores.
+  // Pendiente: USB Host + HID
 }
 
 }  // namespace ups_hid
 }  // namespace esphome
-
