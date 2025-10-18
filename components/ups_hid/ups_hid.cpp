@@ -152,4 +152,4 @@ void UpsHid::host_daemon_task_(void *arg) {
       ESP_LOGW(TAG, "[usbh_daemon] handle_events err=0x%X", (unsigned) err);
     }
   }
-}
+
