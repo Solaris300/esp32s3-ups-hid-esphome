@@ -100,6 +100,32 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
       if (e == ESP_OK) {
         self->dev_addr_ = msg->new_dev.address;
         ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
+#if ESP_IDF_VERSION_MAJOR >= 5
+  #ifdef usb_host_device_info     // si el símbolo existe en tu IDF
+    {
+      usb_host_device_info_t dinfo{};
+      esp_err_t ie = usb_host_device_info(self->dev_handle_, &dinfo);
+      if (ie == ESP_OK) {
+        const usb_device_desc_t *dd = &dinfo.dev_desc;
+        ESP_LOGI(TAG,
+                 "[dev] VID=0x%04X PID=0x%04X class=0x%02X sub=0x%02X proto=0x%02X speed=%s",
+                 dd->idVendor, dd->idProduct, dd->bDeviceClass, dd->bDeviceSubClass,
+                 dd->bDeviceProtocol,
+                 (dinfo.speed == USB_SPEED_LOW  ? "LOW"  :
+                  dinfo.speed == USB_SPEED_FULL ? "FULL" :
+                  dinfo.speed == USB_SPEED_HIGH ? "HIGH" : "UNKNOWN"));
+      } else {
+        ESP_LOGW(TAG, "[dev] usb_host_device_info() failed: 0x%X", (unsigned) ie);
+      }
+    }
+  #else
+    ESP_LOGW(TAG, "[dev] usb_host_device_info() not available in this IDF — skipping VID/PID log.");
+  #endif
+#else
+  ESP_LOGW(TAG, "[dev] IDF < v5 no soportado para usb_host_device_info().");
+#endif
+
+        
       } else {
         ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
                  (unsigned) msg->new_dev.address, (unsigned) e);
