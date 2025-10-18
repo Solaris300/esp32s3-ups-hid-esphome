@@ -90,17 +90,38 @@ void UpsHid::client_task_(void *arg) {
 }
 
 void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg) {
+  auto *self = static_cast<UpsHid *>(arg);
+  if (!self) return;
+
   switch (msg->event) {
-    case USB_HOST_CLIENT_EVENT_NEW_DEV:
-      ESP_LOGI(TAG, "[attach] NEW_DEV");
+    case USB_HOST_CLIENT_EVENT_NEW_DEV: {
+      // Abre el dispositivo y guarda addr/handle
+      esp_err_t e = usb_host_device_open(self->client_, msg->new_dev.address, &self->dev_handle_);
+      if (e == ESP_OK) {
+        self->dev_addr_ = msg->new_dev.address;
+        ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
+      } else {
+        ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
+                 (unsigned) msg->new_dev.address, (unsigned) e);
+      }
       break;
-    case USB_HOST_CLIENT_EVENT_DEV_GONE:
+    }
+    case USB_HOST_CLIENT_EVENT_DEV_GONE: {
+      // Cierra solo si es el que teníamos abierto
+      if (self->dev_handle_ != nullptr /* && msg->dev_gone.dev_addr == self->dev_addr_ (no todos los IDF exponen campo) */) {
+        usb_host_device_close(self->client_, self->dev_handle_);
+        self->dev_handle_ = nullptr;
+      }
+      self->dev_addr_ = 0;
       ESP_LOGI(TAG, "[detach] DEV_GONE");
       break;
+    }
     default:
       ESP_LOGI(TAG, "[client] event=%d", (int) msg->event);
       break;
   }
+}
+
 }
 
 }  // namespace ups_hid
