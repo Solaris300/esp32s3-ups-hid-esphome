@@ -3,7 +3,12 @@
 #include "esphome/core/log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "usb/usb_host.h"   // <-- Host Library base
+#include "usb/usb_host.h"
+#include "esp_idf_version.h"
+#include "usb/usb_types_ch9.h"     // usb_device_desc_t
+#if __has_include("usb/usb_types_stack.h")
+  #include "usb/usb_types_stack.h" // usb_host_device_info_t (IDF 5.x)
+#endif
 
 namespace esphome {
 namespace ups_hid {
