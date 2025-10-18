@@ -59,27 +59,32 @@ void UpsHid::client_task_(void *arg) {
   }
 
   while (true) {
-    usb_host_client_event_msg_t msg;
-    esp_err_t err = usb_host_client_handle_events(self->client_, &msg, pdMS_TO_TICKS(1000));
+    // 1) Espera eventos en el cliente
+    esp_err_t err = usb_host_client_handle_events(self->client_, pdMS_TO_TICKS(1000));
     if (err == ESP_OK) {
-      switch (msg.event) {
-        case USB_HOST_CLIENT_EVENT_NEW_DEV:
-          ESP_LOGI(TAG, "[attach] NEW_DEV addr=%d", (int)msg.new_dev.address);
-          break;
-        case USB_HOST_CLIENT_EVENT_DEV_GONE:
-          ESP_LOGI(TAG, "[detach] DEV_GONE addr=%d", (int)msg.dev_gone.dev_addr);
-          break;
-        default:
-          ESP_LOGI(TAG, "[client] event=%d", (int)msg.event);
-          break;
+      // 2) Drena la cola de mensajes disponibles
+      usb_host_client_event_msg_t msg;
+      while (usb_host_client_get_event(self->client_, &msg) == ESP_OK) {
+        switch (msg.event) {
+          case USB_HOST_CLIENT_EVENT_NEW_DEV:
+            ESP_LOGI(TAG, "[attach] NEW_DEV");
+            break;
+          case USB_HOST_CLIENT_EVENT_DEV_GONE:
+            ESP_LOGI(TAG, "[detach] DEV_GONE");
+            break;
+          default:
+            ESP_LOGI(TAG, "[client] event=%d", (int) msg.event);
+            break;
+        }
       }
     } else if (err == ESP_ERR_TIMEOUT) {
-      // sin mensajes
+      // sin mensajes, normal
     } else {
-      ESP_LOGW(TAG, "[usbh_client] usb_host_client_handle_events err=0x%X", (unsigned)err);
+      ESP_LOGW(TAG, "[usbh_client] usb_host_client_handle_events err=0x%X", (unsigned) err);
     }
   }
 }
+
 
 void UpsHid::dump_config() {
   ESP_LOGCONFIG(TAG, "UPS HID component is configured.");
