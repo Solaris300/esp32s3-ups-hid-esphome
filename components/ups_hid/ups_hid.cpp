@@ -6,11 +6,8 @@ namespace ups_hid {
 static const char *const TAG = "ups_hid";
 
 void UpsHid::setup() {
-  // 1) Instalar librería USB Host
-  usb_host_config_t cfg = {
-      .skip_phy_setup = false,  // usamos el PHY interno del S3
-      .intr_flags = 0,
-  };
+  // 1) Instalar librería USB Host (ya lo tenías)
+  usb_host_config_t cfg = {.skip_phy_setup = false, .intr_flags = 0};
   esp_err_t err = usb_host_install(&cfg);
   if (err == ESP_OK) {
     ESP_LOGI(TAG, "USB Host Library installed.");
@@ -19,8 +16,22 @@ void UpsHid::setup() {
     return;
   }
 
-  // 2) Crear tarea "daemon" que atiende eventos del Host Library
+  // 2) Tarea daemon (ya la tenías)
   xTaskCreatePinnedToCore(UpsHid::host_daemon_task_, "usbh_daemon", 4096, nullptr, 5, nullptr, tskNO_AFFINITY);
+
+  // 3) --- NUEVO: registrar un cliente para recibir eventos attach/detach ---
+  usb_host_client_config_t client_cfg = {
+      .is_synchronous = false,         // asíncrono (recibe mensajes en cola)
+      .max_num_event_msg = 8,          // cola de mensajes
+      .async = {.client_event_callback = nullptr, .callback_arg = nullptr}, // no usamos callback directo
+  };
+  err = usb_host_client_register(&client_cfg, &this->client_);
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "USB Host client registered.");
+    xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client", 4096, this, 5, nullptr, tskNO_AFFINITY);
+  } else {
+    ESP_LOGE(TAG, "usb_host_client_register() failed: 0x%X", (unsigned)err);
+  }
 }
 
 void UpsHid::host_daemon_task_(void *arg) {
@@ -28,14 +39,45 @@ void UpsHid::host_daemon_task_(void *arg) {
   while (true) {
     esp_err_t err = usb_host_lib_handle_events(pdMS_TO_TICKS(1000), &flags);
     if (err == ESP_OK && flags) {
-      ESP_LOGI(TAG, "USB Host event flags: 0x%08X", (unsigned)flags);
+      ESP_LOGI(TAG, "[usbh_daemon] USB Host event flags: 0x%08X", (unsigned)flags);
       flags = 0;
     } else if (err == ESP_ERR_TIMEOUT) {
-      // normal, sin eventos
+      // sin eventos
     } else if (err != ESP_OK) {
-      ESP_LOGW(TAG, "usb_host_lib_handle_events() err=0x%X", (unsigned)err);
+      ESP_LOGW(TAG, "[usbh_daemon] usb_host_lib_handle_events() err=0x%X", (unsigned)err);
     }
-    // (no desinstalamos el host aquí; queda residente)
+  }
+}
+
+// --- NUEVO: tarea que drena los mensajes del cliente y loguea attach/detach ---
+void UpsHid::client_task_(void *arg) {
+  auto *self = static_cast<UpsHid *>(arg);
+  if (!self || !self->client_) {
+    ESP_LOGE(TAG, "[usbh_client] No client handle.");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  while (true) {
+    usb_host_client_event_msg_t msg;
+    esp_err_t err = usb_host_client_handle_events(self->client_, &msg, pdMS_TO_TICKS(1000));
+    if (err == ESP_OK) {
+      switch (msg.event) {
+        case USB_HOST_CLIENT_EVENT_NEW_DEV:
+          ESP_LOGI(TAG, "[attach] NEW_DEV addr=%d", (int)msg.new_dev.address);
+          break;
+        case USB_HOST_CLIENT_EVENT_DEV_GONE:
+          ESP_LOGI(TAG, "[detach] DEV_GONE addr=%d", (int)msg.dev_gone.dev_addr);
+          break;
+        default:
+          ESP_LOGI(TAG, "[client] event=%d", (int)msg.event);
+          break;
+      }
+    } else if (err == ESP_ERR_TIMEOUT) {
+      // sin mensajes
+    } else {
+      ESP_LOGW(TAG, "[usbh_client] usb_host_client_handle_events err=0x%X", (unsigned)err);
+    }
   }
 }
 
