@@ -17,6 +17,8 @@ class UpsHid : public PollingComponent {
  private:
   bool hello_logged_{false};
   static void host_daemon_task_(void *arg);
+  static void client_task_(void *arg);
+  usb_host_client_handle_t client_{nullptr};
 };
 
 }  // namespace ups_hid
