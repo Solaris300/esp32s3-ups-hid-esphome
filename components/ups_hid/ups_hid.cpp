@@ -11,6 +11,7 @@ void UpsHid::setup() {
 
 void UpsHid::dump_config() {
   ESP_LOGCONFIG(TAG, "UPS HID component is configured.");
+  ESP_LOGI(TAG, "UPS HID component started (hello from ESPHome external component)."); // visible ya
 }
 
 void UpsHid::update() {
