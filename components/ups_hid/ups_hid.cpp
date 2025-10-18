@@ -7,8 +7,8 @@ namespace ups_hid {
 static const char *const TAG = "ups_hid";
 
 // --- PLAN B: GET_DESCRIPTOR(Device) por control transfer (solo en este .cpp) ---
-static bool read_device_descriptor_ctrl_(usb_device_handle_t dev_handle) {
-  if (!dev_handle) return false;
+static bool read_device_descriptor_ctrl_(usb_host_client_handle_t client, usb_device_handle_t dev_handle) {
+  if (!client || !dev_handle) return false;
 
   const int desc_len  = 18;
   const int total_len = USB_SETUP_PACKET_SIZE + desc_len;
@@ -23,26 +23,28 @@ static bool read_device_descriptor_ctrl_(usb_device_handle_t dev_handle) {
   usb_setup_packet_t *setup = (usb_setup_packet_t *) xfer->data_buffer;
   setup->bmRequestType = 0x80;                      // IN | Standard | Device
   setup->bRequest      = 0x06;                      // GET_DESCRIPTOR
-  setup->wValue        = (uint16_t)((1 << 8) | 0);  // (DEVICE=1) << 8 | 0
+  setup->wValue        = (uint16_t)((1 << 8) | 0);  // DEVICE(1)<<8 | 0
   setup->wIndex        = 0;
   setup->wLength       = desc_len;
 
-  xfer->num_bytes = total_len;
-  xfer->callback  = nullptr;
-  xfer->context   = nullptr;
+  xfer->num_bytes         = total_len;
+  xfer->callback          = nullptr;
+  xfer->context           = nullptr;
+  xfer->device_handle     = dev_handle;   // <— IMPORTANTE
+  xfer->bEndpointAddress  = 0x00;         // EP0 (control)
+  xfer->flags             = 0;
 
-  // Enviar control transfer (API correcta en IDF 5.4.x)
-  esp_err_t e = usb_host_transfer_submit_control(dev_handle, xfer);
+  // Enviar control transfer: pasa el CLIENT handle (IDF 5.4.x)
+  esp_err_t e = usb_host_transfer_submit_control(client, xfer);
   if (e != ESP_OK) {
     ESP_LOGE(TAG, "[dev] transfer_submit_control failed: 0x%X", (unsigned) e);
     usb_host_transfer_free(xfer);
     return false;
   }
 
-  // Espera acotada a que termine (las tareas del host ya están corriendo)
+  // Espera acotada a que el host complete
   const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
   while (xTaskGetTickCount() < deadline) {
-    // Estados terminales típicos en IDF 5.4.x
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED ||
         xfer->status == USB_TRANSFER_STATUS_ERROR ||
         xfer->status == USB_TRANSFER_STATUS_STALL ||
@@ -61,7 +63,7 @@ static bool read_device_descriptor_ctrl_(usb_device_handle_t dev_handle) {
 
   // Descriptor tras el setup (8 bytes)
   const uint8_t *d = xfer->data_buffer + USB_SETUP_PACKET_SIZE;
-  if (d[0] < 18 || d[1] != 1) {  // bLength, bDescriptorType=DEVICE(1)
+  if (d[0] < 18 || d[1] != 1) {
     ESP_LOGW(TAG, "[dev] invalid device descriptor header: bLen=%u bType=%u", d[0], d[1]);
     usb_host_transfer_free(xfer);
     return false;
@@ -192,7 +194,7 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
         }
   #else
         // --- B) Tu IDF 5.4.2: usar control transfer GET_DESCRIPTOR(Device)
-        if (!read_device_descriptor_ctrl_(self->dev_handle_)) {
+       if (!read_device_descriptor_ctrl_(self->client_, self->dev_handle_)) {
           ESP_LOGW(TAG, "[dev] GET_DESCRIPTOR(Device) failed or timed out");
         }
   #endif
