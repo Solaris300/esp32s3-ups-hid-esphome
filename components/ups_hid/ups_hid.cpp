@@ -6,19 +6,19 @@ namespace ups_hid {
 static const char *const TAG = "ups_hid";
 
 void UpsHid::setup() {
-  // Deja setup vacío por ahora o con logs DEBUG si quieres.
+  // init mínimo por ahora
 }
 
 void UpsHid::dump_config() {
   ESP_LOGCONFIG(TAG, "UPS HID component is configured.");
 }
 
-void UpsHid::loop() {
+void UpsHid::update() {
   if (!this->hello_logged_) {
     ESP_LOGI(TAG, "UPS HID component started (hello from ESPHome external component).");
     this->hello_logged_ = true;
   }
-  // Aquí vendrá la lógica de USB Host en los siguientes pasos.
+  // aquí más adelante: USB Host + HID
 }
 
 }  // namespace ups_hid
