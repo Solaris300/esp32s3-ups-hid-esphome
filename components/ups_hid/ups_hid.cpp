@@ -122,7 +122,5 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
   }
 }
 
-}
-
 }  // namespace ups_hid
 }  // namespace esphome
