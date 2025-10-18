@@ -141,10 +141,15 @@ void UpsHid::host_daemon_task_(void *arg) {
   uint32_t flags = 0;
   while (true) {
     esp_err_t err = usb_host_lib_handle_events(pdMS_TO_TICKS(1000), &flags);
-    if (err == ESP_OK && flags) {
-      ESP_LOGI(TAG, "[usbh_daemon] USB Host event flags: 0x%08X", (unsigned) flags);
-      flags = 0;
+    if (err == ESP_OK) {
+      if (flags) {
+        ESP_LOGI(TAG, "[usbh_daemon] USB Host event flags: 0x%08X", (unsigned) flags);
+        flags = 0;
+      }
     } else if (err == ESP_ERR_TIMEOUT) {
       // sin eventos
-    } else if (err != ESP_OK) {
-      ESP_LOGW(TAG, "[usbh_daemon] handle_events err=0x%X",]()_
+    } else {
+      ESP_LOGW(TAG, "[usbh_daemon] handle_events err=0x%X", (unsigned) err);
+    }
+  }
+}
