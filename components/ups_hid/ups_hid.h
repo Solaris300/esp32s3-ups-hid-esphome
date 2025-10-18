@@ -20,6 +20,9 @@ class UpsHid : public PollingComponent {
   static void client_task_(void *arg);
   static void client_callback_(const usb_host_client_event_msg_t *event_msg, void *arg);
   usb_host_client_handle_t client_{nullptr};
+
+  usb_device_handle_t dev_handle_{nullptr};
+  uint8_t dev_addr_{0};
 };
 
 }  // namespace ups_hid
