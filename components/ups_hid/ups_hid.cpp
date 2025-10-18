@@ -19,10 +19,11 @@ static bool read_device_descriptor_ctrl_(usb_device_handle_t dev_handle) {
     return false;
   }
 
+  // Setup packet: GET_DESCRIPTOR(Device, index 0)
   usb_setup_packet_t *setup = (usb_setup_packet_t *) xfer->data_buffer;
   setup->bmRequestType = 0x80;                      // IN | Standard | Device
   setup->bRequest      = 0x06;                      // GET_DESCRIPTOR
-  setup->wValue        = (uint16_t)((1 << 8) | 0);  // DEVICE(1) << 8 | index 0
+  setup->wValue        = (uint16_t)((1 << 8) | 0);  // (DEVICE=1) << 8 | 0
   setup->wIndex        = 0;
   setup->wLength       = desc_len;
 
@@ -30,20 +31,24 @@ static bool read_device_descriptor_ctrl_(usb_device_handle_t dev_handle) {
   xfer->callback  = nullptr;
   xfer->context   = nullptr;
 
-  esp_err_t e = usb_host_device_submit_control(dev_handle, xfer);
+  // Enviar control transfer (API correcta en IDF 5.4.x)
+  esp_err_t e = usb_host_transfer_submit_control(dev_handle, xfer);
   if (e != ESP_OK) {
-    ESP_LOGE(TAG, "[dev] submit_control failed: 0x%X", (unsigned) e);
+    ESP_LOGE(TAG, "[dev] transfer_submit_control failed: 0x%X", (unsigned) e);
     usb_host_transfer_free(xfer);
     return false;
   }
 
-  // Espera activa corta: las tareas del host ya están corriendo y harán avanzar el transfer
-  TickType_t start = xTaskGetTickCount();
-  while (xfer->status == USB_TRANSFER_STATUS_NOT_READY) {
-    if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(1000)) {
-      ESP_LOGW(TAG, "[dev] control transfer timeout");
-      usb_host_transfer_free(xfer);
-      return false;
+  // Espera acotada a que termine (las tareas del host ya están corriendo)
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+  while (xTaskGetTickCount() < deadline) {
+    // Estados terminales típicos en IDF 5.4.x
+    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED ||
+        xfer->status == USB_TRANSFER_STATUS_ERROR ||
+        xfer->status == USB_TRANSFER_STATUS_STALL ||
+        xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+        xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+      break;
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -54,6 +59,7 @@ static bool read_device_descriptor_ctrl_(usb_device_handle_t dev_handle) {
     return false;
   }
 
+  // Descriptor tras el setup (8 bytes)
   const uint8_t *d = xfer->data_buffer + USB_SETUP_PACKET_SIZE;
   if (d[0] < 18 || d[1] != 1) {  // bLength, bDescriptorType=DEVICE(1)
     ESP_LOGW(TAG, "[dev] invalid device descriptor header: bLen=%u bType=%u", d[0], d[1]);
@@ -70,6 +76,7 @@ static bool read_device_descriptor_ctrl_(usb_device_handle_t dev_handle) {
   usb_host_transfer_free(xfer);
   return true;
 }
+
 
 // ---------- Métodos de la clase ----------
 
