@@ -16,7 +16,7 @@ static volatile bool g_start_listen = false;    // arrancar lectura EP IN fuera 
 static void ctrl_transfer_cb_(usb_transfer_t *transfer) { (void)transfer; }
 
 // callback de la transferencia IN (endpoint interrupt)
-static void in_transfer_cb_(usb_transfer_t *xfer) {
+void in_transfer_cb_(usb_transfer_t *xfer) {
   // Ojo: estamos en contexto de ISR/task del stack USB. Hacemos logs breves.
   if (!g_self) return;
   switch (xfer->status) {
