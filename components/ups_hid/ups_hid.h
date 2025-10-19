@@ -14,11 +14,16 @@
 namespace esphome {
 namespace ups_hid {
 
-class UpsHid : public Component {
+class UpsHid : public PollingComponent {
  public:
   void setup() override;
   void dump_config() override;
-  void loop() override {}  // no usamos loop(); tenemos nuestras tareas
+
+  // Necesario para PollingComponent (main.cpp llamará set_update_interval)
+  void update() override { /* no-op: usamos nuestras tareas */ }
+
+  // No usamos loop(); todo va por tareas
+  void loop() override {}
 
  private:
   // Tareas / callback
@@ -33,7 +38,7 @@ class UpsHid : public Component {
 
   // Info HID descubierta
   uint8_t  hid_if_{0xFF};        // interface number
-  uint8_t  hid_ep_in_{0};        // 0x81 típico (no lo usamos para leer en esta versión)
+  uint8_t  hid_ep_in_{0};        // 0x81 típico
   uint16_t hid_ep_mps_{0};
   uint8_t  hid_ep_interval_{0};
 
