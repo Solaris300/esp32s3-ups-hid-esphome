@@ -27,11 +27,11 @@ class UpsHid : public PollingComponent {
   usb_device_handle_t      dev_handle_{nullptr};
   uint8_t                  dev_addr_{0};
 
-  // Info HID descubierta desde el descriptor de configuración
-  int      hid_if_{-1};         // interfaz HID (o -1 si no disponible)
-  uint8_t  hid_ep_in_{0};       // endpoint de interrupción IN (si existe)
-  uint16_t hid_ep_mps_{0};      // max packet size (si existe)
-  uint8_t  hid_ep_interval_{0}; // intervalo (si existe)
+// Info de HID descubierta
+  uint8_t  hid_if_num_{0xFF};
+  uint8_t  hid_ep_in_{0};
+  uint16_t hid_ep_mps_{0};
+  uint8_t  hid_ep_interval_{0};
 };
 
 }  // namespace ups_hid
