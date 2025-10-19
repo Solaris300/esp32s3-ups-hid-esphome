@@ -7,6 +7,8 @@
 #include "usb/usb_host.h"
 #include "usb/usb_types_ch9.h"   // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
 
+void in_transfer_cb_(usb_transfer_t *xfer);
+
 namespace esphome {
 namespace ups_hid {
 
@@ -18,6 +20,8 @@ class UpsHid : public PollingComponent {
 
  private:
   bool hello_logged_{false};
+
+  friend void in_transfer_cb_(usb_transfer_t *xfer);
 
   // Tareas / callback
   static void host_daemon_task_(void *arg);
