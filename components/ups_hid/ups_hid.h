@@ -32,6 +32,11 @@ class UpsHid : public PollingComponent {
   usb_host_client_handle_t client_{nullptr};
   usb_device_handle_t dev_handle_{nullptr};
   uint8_t dev_addr_{0};
+  
+  // Handles y estado de host
+  usb_host_interface_handle_t if_handle_{nullptr};
+  usb_host_endpoint_handle_t  ep_in_handle_{nullptr};
+  uint8_t hid_if_{0};  // nº de interfaz HID (por ej. 0)
 
   // Descubrimiento HID
   uint8_t hid_ep_in_{0};        // p.ej. 0x81
