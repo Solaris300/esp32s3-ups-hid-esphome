@@ -10,7 +10,7 @@ namespace ups_hid {
 static const char *const TAG = "ups_hid";
 
 // ----------------------------------------------
-// Estado simple + callbacks requeridos por IDF
+// Estado simple + banderas para trabajo fuera del callback
 // ----------------------------------------------
 static UpsHid *g_self = nullptr;
 static volatile bool g_probe_pending = false;  // lanzar descubrimiento fuera del callback
@@ -145,8 +145,8 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   const uint8_t *end = p + payload;
 
   int hid_if = -1;
-  uint8_t ep_in = 0, interval = 0;
-  uint16_t mps = 0;
+  uint8_t  ep_in_loc = 0, interval_loc = 0;
+  uint16_t mps_loc   = 0;
 
   while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
     uint8_t len = p[0], type = p[1];
@@ -175,14 +175,14 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
           q += 3;
         }
       }
-    } else if (type == 5 /*ENDPOINT*/ && len >= 7 && hid_if >= 0 && if_num == (uint8_t)hid_if && ep_in == 0) {
+    } else if (type == 5 /*ENDPOINT*/ && len >= 7 && hid_if >= 0 && if_num == (uint8_t)hid_if && ep_in_loc == 0) {
       uint8_t bEndpointAddress = p[2];
       bool is_in   = (bEndpointAddress & 0x80) != 0;
       bool is_intr = ((p[3] & 0x03) == 3);
       if (is_in && is_intr) {
-        ep_in   = bEndpointAddress;
-        mps     = (uint16_t)(p[4] | (p[5] << 8));
-        interval= p[6];
+        ep_in_loc     = bEndpointAddress;
+        mps_loc       = (uint16_t)(p[4] | (p[5] << 8));
+        interval_loc  = p[6];
       }
     }
     p += len;
@@ -190,13 +190,13 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
 
   usb_host_transfer_free(xfull);
 
-  if (hid_if >= 0 && ep_in != 0) {
+  if (hid_if >= 0 && ep_in_loc != 0) {
     ESP_LOGI(TAG, "[cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
-             ep_in, (unsigned) mps, (unsigned) interval);
+             ep_in_loc, (unsigned) mps_loc, (unsigned) interval_loc);
     // devolver por referencia
-    ep_in   = ep_in;   // (variables locales con mismo nombre; ya asignadas arriba)
-    mps     = mps;
-    interval= interval;
+    ep_in    = ep_in_loc;
+    mps      = mps_loc;
+    interval = interval_loc;
     return true;
   } else {
     ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID o endpoint IN.");
@@ -277,8 +277,8 @@ static bool dump_report_descriptor_(usb_host_client_handle_t client,
     int k = 0;
     for (int i = 0; i < line; i++) {
       if (k + 3 < (int) sizeof(buf)) {
-        int p = off + i;
-        k += snprintf(buf + k, sizeof(buf) - k, "%02X%s", d[p], (i + 1 < line ? " " : ""));
+        int p2 = off + i;
+        k += snprintf(buf + k, sizeof(buf) - k, "%02X%s", d[p2], (i + 1 < line ? " " : ""));
       }
     }
     buf[sizeof(buf)-1] = '\0';
@@ -381,10 +381,10 @@ void UpsHid::client_task_(void *arg) {
     if (g_probe_pending && self->dev_handle_ != nullptr) {
       uint8_t if_num, ep; uint16_t mps; uint8_t itv; uint16_t rdlen;
       if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, if_num, ep, mps, itv, rdlen)) {
-        self->hid_if_num_     = if_num;
-        self->hid_ep_in_      = ep;
-        self->hid_ep_mps_     = mps;
-        self->hid_ep_interval_= itv;
+        self->hid_if_num_      = if_num;
+        self->hid_ep_in_       = ep;
+        self->hid_ep_mps_      = mps;
+        self->hid_ep_interval_ = itv;
 
         ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u",
                  (unsigned) if_num, (unsigned) ep, (unsigned) mps, (unsigned) itv);
