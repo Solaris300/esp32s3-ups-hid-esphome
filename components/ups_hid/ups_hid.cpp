@@ -145,6 +145,9 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   const uint8_t *end = p + payload;
 
   int hid_if = -1;
+  uint8_t ep_in = 0, interval = 0;
+  uint16_t mps = 0;
+
   while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
     uint8_t len = p[0], type = p[1];
 
@@ -160,8 +163,6 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
                  (int) bInterfaceNumber, bClass, bSub, bProto);
       }
     } else if (type == 0x21 /*HID*/ && len >= 6 && hid_if >= 0 && if_num == (uint8_t)hid_if) {
-      // HID descriptor; saltan varios campos, al final vienen pares (desc_type, wLength)
-      // Formato: bLength, bDescriptorType(0x21), bcdHID(2), bCountryCode(1), bNumDescriptors(1), ...
       if (len >= 9) {
         uint8_t bNum = p[5];
         const uint8_t *q = p + 6;
@@ -192,6 +193,10 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   if (hid_if >= 0 && ep_in != 0) {
     ESP_LOGI(TAG, "[cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
              ep_in, (unsigned) mps, (unsigned) interval);
+    // devolver por referencia
+    ep_in   = ep_in;   // (variables locales con mismo nombre; ya asignadas arriba)
+    mps     = mps;
+    interval= interval;
     return true;
   } else {
     ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID o endpoint IN.");
@@ -268,7 +273,6 @@ static bool dump_report_descriptor_(usb_host_client_handle_t client,
 
   for (int off = 0; off < n; off += 16) {
     int line = (n - off >= 16) ? 16 : (n - off);
-    // Construir la línea
     char buf[16 * 3 + 1];
     int k = 0;
     for (int i = 0; i < line; i++) {
@@ -377,10 +381,10 @@ void UpsHid::client_task_(void *arg) {
     if (g_probe_pending && self->dev_handle_ != nullptr) {
       uint8_t if_num, ep; uint16_t mps; uint8_t itv; uint16_t rdlen;
       if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, if_num, ep, mps, itv, rdlen)) {
-        self->hid_if_num_      = if_num;
-        self->hid_ep_in_       = ep;
-        self->hid_ep_mps_      = mps;
-        self->hid_ep_interval_ = itv;
+        self->hid_if_num_     = if_num;
+        self->hid_ep_in_      = ep;
+        self->hid_ep_mps_     = mps;
+        self->hid_ep_interval_= itv;
 
         ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u",
                  (unsigned) if_num, (unsigned) ep, (unsigned) mps, (unsigned) itv);
@@ -419,11 +423,11 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
         usb_host_device_close(self->client_, self->dev_handle_);
         self->dev_handle_ = nullptr;
       }
-      self->dev_addr_       = 0;
-      self->hid_if_num_     = 0xFF;
-      self->hid_ep_in_      = 0;
-      self->hid_ep_mps_     = 0;
-      self->hid_ep_interval_= 0;
+      self->dev_addr_        = 0;
+      self->hid_if_num_      = 0xFF;
+      self->hid_ep_in_       = 0;
+      self->hid_ep_mps_      = 0;
+      self->hid_ep_interval_ = 0;
       ESP_LOGI(TAG, "[detach] DEV_GONE");
       break;
     }
