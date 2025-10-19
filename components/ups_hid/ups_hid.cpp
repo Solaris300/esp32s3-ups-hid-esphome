@@ -1,93 +1,82 @@
 #include "ups_hid.h"
-#include <cstring>
-#include "usb/usb_types_ch9.h"   // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
-#include "esp_timer.h"           // esp_timer_get_time()
+#include "usb/usb_types_ch9.h"  // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
+#include <cstdint>
+
+// NOTA: Este archivo está pensado para ESP-IDF 5.4.x (API de USB Host actual de ESPHome-IDF)
 
 namespace esphome {
 namespace ups_hid {
 
 static const char *const TAG = "ups_hid";
 
-// -----------------------------------------------------
-// Estado simple para orquestar pasos sin tocar el .h
-// -----------------------------------------------------
+// ----------------------------------------------
+// Estado simple + callbacks requeridos por IDF
+// ----------------------------------------------
 static UpsHid *g_self = nullptr;
-static volatile bool g_probe_pending   = false;  // tras NEW_DEV: descubrir interfaz/endpoint
-static volatile bool g_dump_rdesc_once = false;  // tras descubrir IF: leer Report Descriptor una vez
-static volatile bool g_poll_reports    = false;  // tras todo listo: empezar GET_REPORT periódico
-static uint8_t g_if_num = 0;                     // interfaz HID detectada
+static volatile bool g_probe_pending = false;  // lanzar descubrimiento fuera del callback
+
+// callback no-op para transfers de control (IDF 5.4 requiere puntero no nulo)
+static void ctrl_transfer_cb_(usb_transfer_t *transfer) { (void) transfer; }
 
 // -----------------------------------------------------
-// Callback NO-OP requerido por IDF 5.4.x en transfers CTRL
-// -----------------------------------------------------
-static void ctrl_cb_(usb_transfer_t *t) { (void)t; }
-
-// -----------------------------------------------------
-// Utilidades: alloc + submit + wait (CTRL xfer)
-// -----------------------------------------------------
-static bool submit_ctrl_and_wait_(usb_host_client_handle_t client, usb_transfer_t *xfer, uint32_t timeout_ms) {
-  if (!client || !xfer) return false;
-  esp_err_t e = usb_host_transfer_submit_control(client, xfer);
-  if (e != ESP_OK) {
-    ESP_LOGW(TAG, "[ctrl] submit failed: 0x%X", (unsigned) e);
-    return false;
-  }
-  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-  while (xTaskGetTickCount() < deadline) {
-    (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
-    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED ||
-        xfer->status == USB_TRANSFER_STATUS_ERROR ||
-        xfer->status == USB_TRANSFER_STATUS_STALL ||
-        xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
-        xfer->status == USB_TRANSFER_STATUS_CANCELED) {
-      break;
-    }
-  }
-  return xfer->status == USB_TRANSFER_STATUS_COMPLETED;
-}
-
-static bool alloc_setup_(int payload_len, usb_device_handle_t dev, usb_transfer_t **out_xfer) {
-  *out_xfer = nullptr;
-  const int total = USB_SETUP_PACKET_SIZE + payload_len;
-  if (usb_host_transfer_alloc(total, 0, out_xfer) != ESP_OK) return false;
-  usb_transfer_t *x = *out_xfer;
-  x->num_bytes = total;
-  x->callback = ctrl_cb_;            // <-- IDF 5.4.x exige callback no nulo
-  x->context  = nullptr;
-  x->device_handle    = dev;
-  x->bEndpointAddress = 0x00; // EP0
-  x->flags            = 0;
-  return true;
-}
-
-// -----------------------------------------------------
-// Lee Configuration Descriptor -> detecta IF HID y EP IN
+// Helper: lee Configuration Descriptor, localiza HID IF,
+// endpoint IN interrupt y longitud del Report Descriptor
 // -----------------------------------------------------
 static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
                                                 usb_device_handle_t dev_handle,
                                                 uint8_t &if_num, uint8_t &ep_in,
-                                                uint16_t &mps, uint8_t &interval) {
-  if_num = 0; ep_in = 0; mps = 0; interval = 0;
+                                                uint16_t &mps, uint8_t &interval,
+                                                uint16_t &rdesc_len) {
+  if_num = 0xFF;
+  ep_in = 0; mps = 0; interval = 0; rdesc_len = 0;
   if (!client || !dev_handle) return false;
 
-  // A) Header (9 bytes)
+  // A) Leer cabecera de Config (9 bytes)
+  const int hdr_len = 9;
+  const int hdr_tot = USB_SETUP_PACKET_SIZE + hdr_len;
   usb_transfer_t *xhdr = nullptr;
-  if (!alloc_setup_(9, dev_handle, &xhdr)) {
-    ESP_LOGW(TAG, "[cfg] alloc header failed");
+  if (usb_host_transfer_alloc(hdr_tot, 0, &xhdr) != ESP_OK) {
+    ESP_LOGW(TAG, "[cfg] transfer_alloc header failed");
     return false;
   }
   {
-    auto *sh = (usb_setup_packet_t *) xhdr->data_buffer;
-    sh->bmRequestType = 0x80; sh->bRequest = 0x06; // GET_DESCRIPTOR
-    sh->wValue        = (uint16_t)((2 << 8) | 0);  // CONFIGURATION
+    usb_setup_packet_t *sh = (usb_setup_packet_t *) xhdr->data_buffer;
+    sh->bmRequestType = 0x80; // IN | Standard | Device
+    sh->bRequest      = 0x06; // GET_DESCRIPTOR
+    sh->wValue        = (uint16_t)((2 /*CONFIG*/ << 8) | 0);
     sh->wIndex        = 0;
-    sh->wLength       = 9;
+    sh->wLength       = hdr_len;
+
+    xhdr->num_bytes        = hdr_tot;
+    xhdr->callback         = ctrl_transfer_cb_;
+    xhdr->context          = nullptr;
+    xhdr->device_handle    = dev_handle;
+    xhdr->bEndpointAddress = 0x00; // EP0
+    xhdr->flags            = 0;
+
+    if (usb_host_transfer_submit_control(client, xhdr) != ESP_OK) {
+      ESP_LOGW(TAG, "[cfg] submit header failed");
+      usb_host_transfer_free(xhdr);
+      return false;
+    }
+    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
+    while (xTaskGetTickCount() < dl) {
+      (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+      if (xhdr->status == USB_TRANSFER_STATUS_COMPLETED ||
+          xhdr->status == USB_TRANSFER_STATUS_ERROR ||
+          xhdr->status == USB_TRANSFER_STATUS_STALL ||
+          xhdr->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+          xhdr->status == USB_TRANSFER_STATUS_CANCELED) {
+        break;
+      }
+    }
+    if (xhdr->status != USB_TRANSFER_STATUS_COMPLETED) {
+      ESP_LOGW(TAG, "[cfg] header status=0x%X", (unsigned) xhdr->status);
+      usb_host_transfer_free(xhdr);
+      return false;
+    }
   }
-  if (!submit_ctrl_and_wait_(client, xhdr, 1500)) {
-    ESP_LOGW(TAG, "[cfg] header transfer failed status=0x%X", (unsigned) xhdr->status);
-    usb_host_transfer_free(xhdr);
-    return false;
-  }
+
   const uint8_t *cfg_hdr = xhdr->data_buffer + USB_SETUP_PACKET_SIZE;
   if (cfg_hdr[1] != 2 || cfg_hdr[0] < 9) {
     ESP_LOGW(TAG, "[cfg] invalid header bType=%u bLen=%u", cfg_hdr[1], cfg_hdr[0]);
@@ -97,43 +86,98 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   uint16_t wTotalLength = (uint16_t)(cfg_hdr[2] | (cfg_hdr[3] << 8));
   usb_host_transfer_free(xhdr);
 
-  // B) Descriptor completo
+  // B) Leer descriptor de Config COMPLETO
+  int payload = wTotalLength;
+  if (payload < 9) {
+    ESP_LOGW(TAG, "[cfg] total length too short: %u", (unsigned) payload);
+    return false;
+  }
+  // Limitar a algo razonable
+  if (payload > 1024) payload = 1024;
+
+  int total = USB_SETUP_PACKET_SIZE + payload;
   usb_transfer_t *xfull = nullptr;
-  if (!alloc_setup_(wTotalLength, dev_handle, &xfull)) {
-    ESP_LOGW(TAG, "[cfg] alloc full failed");
+  if (usb_host_transfer_alloc(total, 0, &xfull) != ESP_OK) {
+    ESP_LOGW(TAG, "[cfg] transfer_alloc full failed");
     return false;
   }
   {
-    auto *sf = (usb_setup_packet_t *) xfull->data_buffer;
-    sf->bmRequestType = 0x80; sf->bRequest = 0x06; // GET_DESCRIPTOR
-    sf->wValue        = (uint16_t)((2 << 8) | 0);  // CONFIGURATION
+    usb_setup_packet_t *sf = (usb_setup_packet_t *) xfull->data_buffer;
+    sf->bmRequestType = 0x80;
+    sf->bRequest      = 0x06; // GET_DESCRIPTOR
+    sf->wValue        = (uint16_t)((2 /*CONFIG*/ << 8) | 0);
     sf->wIndex        = 0;
-    sf->wLength       = wTotalLength;
-  }
-  if (!submit_ctrl_and_wait_(client, xfull, 2000)) {
-    ESP_LOGW(TAG, "[cfg] full transfer failed status=0x%X", (unsigned) xfull->status);
-    usb_host_transfer_free(xfull);
-    return false;
+    sf->wLength       = payload;
+
+    xfull->num_bytes        = total;
+    xfull->callback         = ctrl_transfer_cb_;
+    xfull->context          = nullptr;
+    xfull->device_handle    = dev_handle;
+    xfull->bEndpointAddress = 0x00; // EP0
+    xfull->flags            = 0;
+
+    if (usb_host_transfer_submit_control(client, xfull) != ESP_OK) {
+      ESP_LOGW(TAG, "[cfg] submit full failed");
+      usb_host_transfer_free(xfull);
+      return false;
+    }
+    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
+    while (xTaskGetTickCount() < dl) {
+      (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+      if (xfull->status == USB_TRANSFER_STATUS_COMPLETED ||
+          xfull->status == USB_TRANSFER_STATUS_ERROR ||
+          xfull->status == USB_TRANSFER_STATUS_STALL ||
+          xfull->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+          xfull->status == USB_TRANSFER_STATUS_CANCELED) {
+        break;
+      }
+    }
+    if (xfull->status != USB_TRANSFER_STATUS_COMPLETED) {
+      ESP_LOGW(TAG, "[cfg] full status=0x%X", (unsigned) xfull->status);
+      usb_host_transfer_free(xfull);
+      return false;
+    }
   }
 
-  // C) Parseo: INTERFACE HID + ENDPOINT IN interrupt
+  // C) Parsear hasta encontrar: INTERFACE HID y su ENDPOINT IN,
+  //    y además el HID descriptor (0x21) para extraer wDescriptorLength (REPORT, 0x22)
   const uint8_t *p   = xfull->data_buffer + USB_SETUP_PACKET_SIZE;
-  const uint8_t *end = p + wTotalLength;
+  const uint8_t *end = p + payload;
+
   int hid_if = -1;
   while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
     uint8_t len = p[0], type = p[1];
-    if (type == 4 && len >= 9) { // INTERFACE
+
+    if (type == 4 /*INTERFACE*/ && len >= 9) {
       uint8_t bInterfaceNumber = p[2];
-      uint8_t bClass = p[5], bSub = p[6], bProto = p[7];
-      if (bClass == 0x03 && hid_if < 0) {
-        hid_if = (int) bInterfaceNumber;
+      uint8_t bClass           = p[5];
+      uint8_t bSub             = p[6];
+      uint8_t bProto           = p[7];
+      if (bClass == 0x03 /*HID*/ && hid_if < 0) {
+        hid_if = bInterfaceNumber;
+        if_num = bInterfaceNumber;
         ESP_LOGI(TAG, "[cfg] HID IF=%d class=0x%02X sub=0x%02X proto=0x%02X",
-                 (int)bInterfaceNumber, bClass, bSub, bProto);
+                 (int) bInterfaceNumber, bClass, bSub, bProto);
       }
-    } else if (type == 5 && len >= 7 && hid_if >= 0 && ep_in == 0) { // ENDPOINT
+    } else if (type == 0x21 /*HID*/ && len >= 6 && hid_if >= 0 && if_num == (uint8_t)hid_if) {
+      // HID descriptor; saltan varios campos, al final vienen pares (desc_type, wLength)
+      // Formato: bLength, bDescriptorType(0x21), bcdHID(2), bCountryCode(1), bNumDescriptors(1), ...
+      if (len >= 9) {
+        uint8_t bNum = p[5];
+        const uint8_t *q = p + 6;
+        for (uint8_t i = 0; i < bNum && q + 3 <= p + len; i++) {
+          uint8_t  cls_desc_type = q[0];
+          uint16_t cls_desc_len  = (uint16_t)(q[1] | (q[2] << 8));
+          if (cls_desc_type == 0x22 /*REPORT*/) {
+            rdesc_len = cls_desc_len;
+          }
+          q += 3;
+        }
+      }
+    } else if (type == 5 /*ENDPOINT*/ && len >= 7 && hid_if >= 0 && if_num == (uint8_t)hid_if && ep_in == 0) {
       uint8_t bEndpointAddress = p[2];
-      bool is_in  = (bEndpointAddress & 0x80) != 0;
-      bool is_intr= ((p[3] & 0x03) == 3);
+      bool is_in   = (bEndpointAddress & 0x80) != 0;
+      bool is_intr = ((p[3] & 0x03) == 3);
       if (is_in && is_intr) {
         ep_in   = bEndpointAddress;
         mps     = (uint16_t)(p[4] | (p[5] << 8));
@@ -146,94 +190,100 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   usb_host_transfer_free(xfull);
 
   if (hid_if >= 0 && ep_in != 0) {
-    if_num = (uint8_t) hid_if;
     ESP_LOGI(TAG, "[cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
              ep_in, (unsigned) mps, (unsigned) interval);
     return true;
+  } else {
+    ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID o endpoint IN.");
+    return false;
   }
-  ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID o endpoint IN.");
-  return false;
 }
 
 // -----------------------------------------------------
-// Lee HID Report Descriptor (tipo 0x22) en IF = if_num
+// Helper: lee y vuelca el Report Descriptor completo
 // -----------------------------------------------------
-static bool hid_get_report_descriptor_(usb_host_client_handle_t client,
-                                       usb_device_handle_t dev,
-                                       uint8_t if_num,
-                                       uint8_t *out_buf, int max_len, int &got_len) {
-  got_len = 0;
-  if (!client || !dev || !out_buf || max_len <= 0) return false;
+static bool dump_report_descriptor_(usb_host_client_handle_t client,
+                                    usb_device_handle_t dev_handle,
+                                    uint8_t interface_number,
+                                    uint16_t rdesc_len) {
+  if (!client || !dev_handle) return false;
+  if (rdesc_len == 0) rdesc_len = 512;  // fallback típico
+  if (rdesc_len > 1024) rdesc_len = 1024;
 
-  const int req_len = (max_len < 512) ? max_len : 512;
-  usb_transfer_t *x = nullptr;
-  if (!alloc_setup_(req_len, dev, &x)) {
-    ESP_LOGW(TAG, "[rdesc] alloc failed");
+  int total = USB_SETUP_PACKET_SIZE + rdesc_len;
+  usb_transfer_t *xfer = nullptr;
+  if (usb_host_transfer_alloc(total, 0, &xfer) != ESP_OK) {
+    ESP_LOGW(TAG, "[rdesc] transfer_alloc failed");
     return false;
   }
+
+  usb_setup_packet_t *su = (usb_setup_packet_t *) xfer->data_buffer;
+  su->bmRequestType = 0x81;                           // IN | Standard | Interface
+  su->bRequest      = 0x06;                           // GET_DESCRIPTOR
+  su->wValue        = (uint16_t)((0x22 /*REPORT*/ << 8) | 0);
+  su->wIndex        = interface_number;               // interface
+  su->wLength       = rdesc_len;
+
+  xfer->num_bytes        = total;
+  xfer->callback         = ctrl_transfer_cb_;
+  xfer->context          = nullptr;
+  xfer->device_handle    = dev_handle;
+  xfer->bEndpointAddress = 0x00; // EP0
+  xfer->flags            = 0;
+
+  esp_err_t se = usb_host_transfer_submit_control(client, xfer);
+  if (se != ESP_OK) {
+    ESP_LOGW(TAG, "[rdesc] submit failed: 0x%X", (unsigned) se);
+    usb_host_transfer_free(xfer);
+    return false;
+  }
+
+  // Esperar finalización
   {
-    auto *s = (usb_setup_packet_t *) x->data_buffer;
-    s->bmRequestType = 0x81;                      // IN | Class | Interface
-    s->bRequest      = 0x06;                      // GET_DESCRIPTOR
-    s->wValue        = (uint16_t)((0x22 << 8) | 0); // REPORT descriptor
-    s->wIndex        = if_num;                    // interfaz HID
-    s->wLength       = req_len;
+    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+    while (xTaskGetTickCount() < dl) {
+      (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+      if (xfer->status == USB_TRANSFER_STATUS_COMPLETED ||
+          xfer->status == USB_TRANSFER_STATUS_ERROR ||
+          xfer->status == USB_TRANSFER_STATUS_STALL ||
+          xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+          xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+        break;
+      }
+    }
   }
-  bool ok = submit_ctrl_and_wait_(client, x, 2000);
-  if (!ok) {
-    ESP_LOGW(TAG, "[rdesc] transfer failed status=0x%X", (unsigned) x->status);
-    usb_host_transfer_free(x);
-    return false;
-  }
-  int n = x->actual_num_bytes;
-  if (n > req_len) n = req_len;
-  if (n > max_len) n = max_len;
-  if (n > 0) {
-    std::memcpy(out_buf, x->data_buffer + USB_SETUP_PACKET_SIZE, n);
-    got_len = n;
-  }
-  usb_host_transfer_free(x);
-  return got_len > 0;
-}
 
-// -----------------------------------------------------
-// GET_REPORT (Input report) por control (polling)
-// -----------------------------------------------------
-static bool hid_get_input_report_(usb_host_client_handle_t client,
-                                  usb_device_handle_t dev,
-                                  uint8_t if_num,
-                                  uint8_t report_id,
-                                  uint8_t *out_buf, int max_len, int &got_len) {
-  got_len = 0;
-  if (!client || !dev || !out_buf || max_len <= 0) return false;
+  if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
+    ESP_LOGW(TAG, "[rdesc] status=0x%X", (unsigned) xfer->status);
+    usb_host_transfer_free(xfer);
+    return false;
+  }
 
-  usb_transfer_t *x = nullptr;
-  if (!alloc_setup_(max_len, dev, &x)) {
-    ESP_LOGW(TAG, "[poll] alloc failed");
-    return false;
+  // Volcado bonito en líneas de 16 bytes con pequeñas pausas
+  const uint8_t *d   = xfer->data_buffer + USB_SETUP_PACKET_SIZE;
+  int             n  = xfer->actual_num_bytes;
+  if (n > rdesc_len) n = rdesc_len;
+
+  ESP_LOGI(TAG, "[rdesc] len=%d bytes", n);
+
+  for (int off = 0; off < n; off += 16) {
+    int line = (n - off >= 16) ? 16 : (n - off);
+    // Construir la línea
+    char buf[16 * 3 + 1];
+    int k = 0;
+    for (int i = 0; i < line; i++) {
+      if (k + 3 < (int) sizeof(buf)) {
+        int p = off + i;
+        k += snprintf(buf + k, sizeof(buf) - k, "%02X%s", d[p], (i + 1 < line ? " " : ""));
+      }
+    }
+    buf[sizeof(buf)-1] = '\0';
+    ESP_LOGI(TAG, "[rdesc] %s", buf);
+    vTaskDelay(pdMS_TO_TICKS(5));  // pausita para que el logger no trunque
   }
-  {
-    auto *s = (usb_setup_packet_t *) x->data_buffer;
-    s->bmRequestType = 0xA1;                // IN | Class | Interface
-    s->bRequest      = 0x01;                // GET_REPORT
-    s->wValue        = (uint16_t)((0x01 << 8) | report_id); // TYPE=Input(1), ID
-    s->wIndex        = if_num;
-    s->wLength       = max_len;
-  }
-  bool ok = submit_ctrl_and_wait_(client, x, 1200);
-  if (!ok) {
-    ESP_LOGW(TAG, "[poll] transfer failed status=0x%X", (unsigned) x->status);
-    usb_host_transfer_free(x);
-    return false;
-  }
-  int n = x->actual_num_bytes;
-  if (n > max_len) n = max_len;
-  if (n > 0) {
-    std::memcpy(out_buf, x->data_buffer + USB_SETUP_PACKET_SIZE, n);
-    got_len = n;
-  }
-  usb_host_transfer_free(x);
-  return got_len > 0;
+
+  usb_host_transfer_free(xfer);
+  return true;
 }
 
 // =====================================================
@@ -265,15 +315,14 @@ void UpsHid::setup() {
       },
   };
   err = usb_host_client_register(&client_cfg, &this->client_);
-  if (err == ESP_OK) {
-    ESP_LOGI(TAG, "USB Host client registered.");
-    // 4) Tarea que despacha eventos
-    xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client",
-                            4096, this, 5, nullptr, tskNO_AFFINITY);
-  } else {
+  if (err != ESP_OK) {
     ESP_LOGE(TAG, "usb_host_client_register() failed: 0x%X", (unsigned) err);
     return;
   }
+
+  // 4) Tarea que despacha eventos
+  xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client",
+                          4096, this, 5, nullptr, tskNO_AFFINITY);
 
   g_self = this;
 }
@@ -318,77 +367,28 @@ void UpsHid::client_task_(void *arg) {
     vTaskDelete(nullptr);
     return;
   }
-
-  // temporizador para polling sencillo
-  int64_t last_poll_us = 0;
-
   while (true) {
     esp_err_t err = usb_host_client_handle_events(self->client_, pdMS_TO_TICKS(100));
     if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
       ESP_LOGW(TAG, "[usbh_client] handle_events err=0x%X", (unsigned) err);
     }
 
-    // 1) Descubrimiento HID (fuera del callback)
+    // Descubrimiento/lectura del descriptor tras NEW_DEV (fuera del callback)
     if (g_probe_pending && self->dev_handle_ != nullptr) {
-      uint8_t ifn, ep; uint16_t mps; uint8_t itv;
-      if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, ifn, ep, mps, itv)) {
-        g_if_num            = ifn;
-        self->hid_ep_in_    = ep;
-        self->hid_ep_mps_   = mps;
+      uint8_t if_num, ep; uint16_t mps; uint8_t itv; uint16_t rdlen;
+      if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, if_num, ep, mps, itv, rdlen)) {
+        self->hid_if_num_      = if_num;
+        self->hid_ep_in_       = ep;
+        self->hid_ep_mps_      = mps;
         self->hid_ep_interval_ = itv;
+
         ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u",
-                 (unsigned) g_if_num, (unsigned) ep, (unsigned) mps, (unsigned) itv);
-        g_dump_rdesc_once = true; // siguiente paso: leer Report Descriptor
+                 (unsigned) if_num, (unsigned) ep, (unsigned) mps, (unsigned) itv);
+
+        // Volcado del Report Descriptor completo
+        (void) dump_report_descriptor_(self->client_, self->dev_handle_, self->hid_if_num_, rdlen);
       }
       g_probe_pending = false;
-    }
-
-    // 2) Dump único del HID Report Descriptor
-    if (g_dump_rdesc_once && self->dev_handle_ != nullptr) {
-      uint8_t buf[512];
-      int n = 0;
-      if (hid_get_report_descriptor_(self->client_, self->dev_handle_, g_if_num, buf, sizeof(buf), n)) {
-        // Log en hex acotado (32 bytes por línea)
-        char line[3*32+1];
-        int pos = 0;
-        ESP_LOGI(TAG, "[rdesc] len=%d bytes", n);
-        for (int i = 0; i < n; i++) {
-          pos += snprintf(line + (pos >= (int)sizeof(line) ? (int)sizeof(line)-1 : pos),
-                          sizeof(line) - pos, "%02X%s", buf[i],
-                          ((i % 32)==31 || i==n-1) ? "" : " ");
-          if ((i % 32) == 31 || i == n - 1) {
-            ESP_LOGI(TAG, "[rdesc] %s", line);
-            pos = 0;
-          }
-        }
-      } else {
-        ESP_LOGW(TAG, "[rdesc] GET_DESCRIPTOR(Report) falló");
-      }
-      // activar polling de informes de entrada por control
-      g_poll_reports    = true;
-      g_dump_rdesc_once = false;
-      last_poll_us = esp_timer_get_time();
-    }
-
-    // 3) Polling cada ~1000 ms del Input Report (por control)
-    if (g_poll_reports && self->dev_handle_ != nullptr) {
-      int64_t now = esp_timer_get_time();
-      if (now - last_poll_us >= 1000 * 1000) {
-        last_poll_us = now;
-        uint8_t rep[64];
-        int got = 0;
-        if (hid_get_input_report_(self->client_, self->dev_handle_, g_if_num, /*report_id*/ 0, rep, sizeof(rep), got) && got > 0) {
-          // Log corto en hex
-          int max_log = got < 32 ? got : 32;
-          char buf[3*32 + 1]; int k = 0;
-          for (int i = 0; i < max_log; i++) {
-            k += snprintf(buf + k, sizeof(buf) - k, "%02X%s", rep[i], (i + 1 < max_log ? " " : ""));
-            if (k >= (int)sizeof(buf)) break;
-          }
-          ESP_LOGI(TAG, "[poll] GET_REPORT len=%d data=%s%s", got, buf, (got > max_log ? " ..." : ""));
-          // TODO: aquí mapearemos campos (voltaje, %bat, etc.) según el descriptor
-        }
-      }
     }
   }
 }
@@ -404,30 +404,30 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
       if (e == ESP_OK) {
         self->dev_addr_ = msg->new_dev.address;
         ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
-        // Lanzamos descubrimiento fuera del callback
-        g_probe_pending   = true;
-        g_dump_rdesc_once = false;
-        g_poll_reports    = false;
+        // Lanzar descubrimiento fuera del callback
+        g_probe_pending = true;
       } else {
         ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
                  (unsigned) msg->new_dev.address, (unsigned) e);
       }
       break;
     }
+
     case USB_HOST_CLIENT_EVENT_DEV_GONE: {
-      // Reset estados
-      g_probe_pending   = false;
-      g_dump_rdesc_once = false;
-      g_poll_reports    = false;
+      // Cerrar y limpiar
       if (self->dev_handle_ != nullptr) {
         usb_host_device_close(self->client_, self->dev_handle_);
         self->dev_handle_ = nullptr;
       }
-      self->dev_addr_ = 0;
-      self->hid_ep_in_ = 0;
+      self->dev_addr_       = 0;
+      self->hid_if_num_     = 0xFF;
+      self->hid_ep_in_      = 0;
+      self->hid_ep_mps_     = 0;
+      self->hid_ep_interval_= 0;
       ESP_LOGI(TAG, "[detach] DEV_GONE");
       break;
     }
+
     default:
       ESP_LOGI(TAG, "[client] event=%d", (int) msg->event);
       break;
