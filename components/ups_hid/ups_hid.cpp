@@ -170,7 +170,7 @@ static bool dump_report_descriptor_(usb_host_client_handle_t client,
                                     uint16_t max_len_hint) {
   if (!client || !dev_handle || if_num == 0xFF) return false;
 
-  // Intentamos hasta 1024, pero empezamos con hint (de config wTotalLength no es el rdesc)
+  // Intentamos hasta 1024, pero empezamos con hint razonable
   uint16_t ask = 1024;
   if (max_len_hint >= 32 && max_len_hint <= 1024) ask = max_len_hint;
 
@@ -332,13 +332,6 @@ void UpsHid::dump_config() {
   ESP_LOGI(TAG, "UPS Host init step ready (no HID yet).");
 }
 
-void UpsHid::update() {
-  if (!this->hello_logged_) {
-    ESP_LOGI(TAG, "UPS HID component started (hello from ESPHome external component).");
-    this->hello_logged_ = true;
-  }
-}
-
 // =====================================================
 // Funciones estáticas (tareas/callback)
 // =====================================================
@@ -411,7 +404,7 @@ void UpsHid::client_task_(void *arg) {
 
       for (uint8_t rid : report_ids) {
         if (hid_get_report_input_ctrl_(self->client_, self->dev_handle_, self->hid_if_, rid, buf, sizeof(buf), len) && len > 0) {
-          // Log breve: hasta 32 bytes
+          // Log breve: hasta 64 bytes
           int max_log = len < 64 ? len : 64;
           char line[64 * 3 + 1]; int k = 0;
           for (int i = 0; i < max_log; i++) {
