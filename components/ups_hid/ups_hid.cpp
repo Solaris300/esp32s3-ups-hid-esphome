@@ -6,15 +6,15 @@ namespace ups_hid {
 static const char *const TAG = "ups_hid";
 
 // ------------------------------------------------------------------
-// Pequeña utilidad: callback "no-op" requerido por IDF en transfers
+// Callback "no-op" requerido por IDF en transfers de control
 // ------------------------------------------------------------------
 static void ctrl_transfer_cb_(usb_transfer_t *xfer) {
-  (void) xfer;  // no hacemos nada; solo evitar "callback is NULL"
+  (void) xfer;
 }
 
 // ------------------------------------------------------------------
-// En IDF 5.4.x hay que bombear eventos del cliente mientras esperamos
-// una transferencia de control. Esta función espera con timeout.
+// Bombear eventos del cliente mientras esperamos una transferencia
+// de control. Devuelve true si COMPLETED antes del timeout.
 // ------------------------------------------------------------------
 static bool wait_ctrl_done_(usb_host_client_handle_t client, usb_transfer_t *xfer, uint32_t timeout_ms) {
   const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
@@ -32,10 +32,8 @@ static bool wait_ctrl_done_(usb_host_client_handle_t client, usb_transfer_t *xfe
 }
 
 // ------------------------------------------------------------------
-// Lee el Configuration Descriptor completo y localiza:
-//  - primera INTERFACE de clase HID (0x03) => if_num
-//  - su ENDPOINT IN interrupt => ep_in, mps, interval
-// Devuelve true si lo encuentra (y rellena parámetros).
+// Lee Configuration Descriptor y localiza INTERFACE HID + EP IN
+// Rellena if_num, ep_in, mps, interval y total_len_out (wTotalLength).
 // ------------------------------------------------------------------
 static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
                                                 usb_device_handle_t dev_handle,
@@ -45,7 +43,7 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   if_num = 0xFF; ep_in = 0; mps = 0; interval = 0; total_len_out = 0;
   if (!client || !dev_handle) return false;
 
-  // A) Leer cabecera del Configuration Descriptor (9 bytes)
+  // A) Cabecera (9 bytes)
   const int hdr_len = 9;
   const int hdr_tot = USB_SETUP_PACKET_SIZE + hdr_len;
   usb_transfer_t *xhdr = nullptr;
@@ -87,9 +85,9 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   total_len_out = wTotalLength;
   usb_host_transfer_free(xhdr);
 
-  // B) Leer descriptor completo
+  // B) Descriptor completo
   int payload = wTotalLength;
-  if (payload < 9) payload = 9;  // por seguridad
+  if (payload < 9) payload = 9;
   int total   = USB_SETUP_PACKET_SIZE + payload;
   usb_transfer_t *xfull = nullptr;
   if (usb_host_transfer_alloc(total, 0, &xfull) != ESP_OK) {
@@ -121,7 +119,7 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
     return false;
   }
 
-  // C) Parseo lineal
+  // C) Parseo
   const uint8_t *p   = xfull->data_buffer + USB_SETUP_PACKET_SIZE;
   const uint8_t *end = p + payload;
   int hid_if_seen = -1;
@@ -162,7 +160,7 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
 }
 
 // ------------------------------------------------------------------
-// GET_DESCRIPTOR (Report Descriptor) para una interface HID
+// GET_DESCRIPTOR (Report Descriptor) para interface HID
 // ------------------------------------------------------------------
 static bool dump_report_descriptor_(usb_host_client_handle_t client,
                                     usb_device_handle_t dev_handle,
@@ -170,7 +168,6 @@ static bool dump_report_descriptor_(usb_host_client_handle_t client,
                                     uint16_t max_len_hint) {
   if (!client || !dev_handle || if_num == 0xFF) return false;
 
-  // Intentamos hasta 1024, pero empezamos con hint razonable
   uint16_t ask = 1024;
   if (max_len_hint >= 32 && max_len_hint <= 1024) ask = max_len_hint;
 
@@ -183,7 +180,7 @@ static bool dump_report_descriptor_(usb_host_client_handle_t client,
   usb_setup_packet_t *s = (usb_setup_packet_t *) x->data_buffer;
   s->bmRequestType = 0x81;                        // IN | Standard | Interface
   s->bRequest      = 0x06;                        // GET_DESCRIPTOR
-  s->wValue        = (uint16_t)((0x22 << 8) | 0); // REPORT(0x22) << 8 | index 0
+  s->wValue        = (uint16_t)((0x22 << 8) | 0); // REPORT(0x22)
   s->wIndex        = if_num;
   s->wLength       = ask;
 
@@ -209,7 +206,6 @@ static bool dump_report_descriptor_(usb_host_client_handle_t client,
   if (got < 0) got = 0;
   ESP_LOGI(TAG, "[rdesc] len=%d bytes", got);
 
-  // Logueo por líneas de 16 bytes
   const uint8_t *d = x->data_buffer + USB_SETUP_PACKET_SIZE;
   for (int i = 0; i < got; i += 16) {
     char line[16 * 3 + 1];
@@ -226,10 +222,7 @@ static bool dump_report_descriptor_(usb_host_client_handle_t client,
 }
 
 // ------------------------------------------------------------------
-// HID GET_REPORT (Input) por control transfer (IDF 5.4.x)
-// report_type: 1 = Input
-// wValue: (report_type << 8) | report_id
-// wIndex: interface number
+// HID GET_REPORT (Input) por control transfer
 // ------------------------------------------------------------------
 static bool hid_get_report_input_ctrl_(usb_host_client_handle_t client,
                                        usb_device_handle_t dev_handle,
@@ -248,7 +241,7 @@ static bool hid_get_report_input_ctrl_(usb_host_client_handle_t client,
   usb_setup_packet_t *s = (usb_setup_packet_t *) x->data_buffer;
   s->bmRequestType = 0xA1; // IN | Class | Interface
   s->bRequest      = 0x01; // GET_REPORT
-  s->wValue        = (uint16_t)((0x01 << 8) | report_id); // Input report, ID
+  s->wValue        = (uint16_t)((0x01 << 8) | report_id); // Input report
   s->wIndex        = if_num;
   s->wLength       = out_buf_size;
 
@@ -281,17 +274,16 @@ static bool hid_get_report_input_ctrl_(usb_host_client_handle_t client,
 }
 
 // =====================================================
-// Variables de coordinación fuera del callback
+// Coordinación fuera del callback
 // =====================================================
 static UpsHid *g_self = nullptr;
-static volatile bool g_probe_pending = false;  // hacer lectura cfg+rdesc fuera del callback
+static volatile bool g_probe_pending = false;
 
 // =====================================================
 // Métodos de la clase
 // =====================================================
 
 void UpsHid::setup() {
-  // 1) Instalar librería USB Host
   usb_host_config_t cfg = {.skip_phy_setup = false, .intr_flags = 0};
   esp_err_t err = usb_host_install(&cfg);
   if (err != ESP_OK) {
@@ -300,11 +292,9 @@ void UpsHid::setup() {
   }
   ESP_LOGI(TAG, "USB Host Library installed.");
 
-  // 2) Tarea daemon de la librería
   xTaskCreatePinnedToCore(UpsHid::host_daemon_task_, "usbh_daemon",
                           4096, nullptr, 5, nullptr, tskNO_AFFINITY);
 
-  // 3) Registrar cliente asíncrono con callback
   usb_host_client_config_t client_cfg = {
       .is_synchronous = false,
       .max_num_event_msg = 8,
@@ -320,7 +310,6 @@ void UpsHid::setup() {
   }
   ESP_LOGI(TAG, "USB Host client registered.");
 
-  // 4) Tarea que despacha eventos + sondeo periódico
   xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client",
                           6144, this, 5, nullptr, tskNO_AFFINITY);
 
@@ -333,7 +322,7 @@ void UpsHid::dump_config() {
 }
 
 // =====================================================
-// Funciones estáticas (tareas/callback)
+// Tareas / callback
 // =====================================================
 
 void UpsHid::host_daemon_task_(void *arg) {
@@ -362,7 +351,6 @@ void UpsHid::client_task_(void *arg) {
     return;
   }
 
-  // ticks para sondeo
   self->next_poll_tick_ = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
 
   while (true) {
@@ -371,40 +359,37 @@ void UpsHid::client_task_(void *arg) {
       ESP_LOGW(TAG, "[usbh_client] handle_events err=0x%X", (unsigned) err);
     }
 
-    // A) Descubrimiento (leer cfg + endpoint + rdesc) fuera del callback
+    // Descubrimiento (cfg + endpoint + report descriptor)
     if (g_probe_pending && self->dev_handle_ != nullptr) {
       uint8_t  ifnum = 0xFF, ep = 0; uint16_t mps = 0; uint8_t itv = 0; uint16_t cfglen = 0;
       if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, ifnum, ep, mps, itv, cfglen)) {
-        self->hid_if_         = ifnum;
-        self->hid_ep_in_      = ep;
-        self->hid_ep_mps_     = mps;
-        self->hid_ep_interval_= itv;
-        ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u", (unsigned)ifnum, ep, (unsigned)mps, (unsigned)itv);
+        self->hid_if_          = ifnum;
+        self->hid_ep_in_       = ep;
+        self->hid_ep_mps_      = mps;
+        self->hid_ep_interval_ = itv;
+        ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u",
+                 (unsigned)ifnum, ep, (unsigned)mps, (unsigned)itv);
 
-        // Volcar report descriptor (una vez)
         (void) dump_report_descriptor_(self->client_, self->dev_handle_, self->hid_if_, 512);
 
-        // habilitar sondeo periódico por control
-        self->poll_enabled_ = true;
+        self->poll_enabled_   = true;
         self->next_poll_tick_ = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
       }
       g_probe_pending = false;
     }
 
-    // B) Sondeo periódico GET_REPORT (Input) por control
+    // Sondeo periódico GET_REPORT (Input)
     if (self->poll_enabled_
         && self->dev_handle_ != nullptr
         && self->hid_if_ != 0xFF
         && (int32_t)(xTaskGetTickCount() - self->next_poll_tick_) >= 0) {
 
-      // Lista de report IDs a probar (ajustable)
       const uint8_t report_ids[] = {0x01, 0x64, 0x65, 0x66, 0x67};
       uint8_t buf[64];
       int len = 0;
 
       for (uint8_t rid : report_ids) {
         if (hid_get_report_input_ctrl_(self->client_, self->dev_handle_, self->hid_if_, rid, buf, sizeof(buf), len) && len > 0) {
-          // Log breve: hasta 64 bytes
           int max_log = len < 64 ? len : 64;
           char line[64 * 3 + 1]; int k = 0;
           for (int i = 0; i < max_log; i++) {
@@ -416,7 +401,7 @@ void UpsHid::client_task_(void *arg) {
         }
       }
 
-      self->next_poll_tick_ = xTaskGetTickCount() + pdMS_TO_TICKS(1000);  // cada 1s
+      self->next_poll_tick_ = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
     }
   }
 }
@@ -431,7 +416,7 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
       if (e == ESP_OK) {
         self->dev_addr_ = msg->new_dev.address;
         ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
-        g_probe_pending = true;  // dispara lectura cfg+rdesc fuera del callback
+        g_probe_pending = true;
       } else {
         ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
                  (unsigned) msg->new_dev.address, (unsigned) e);
