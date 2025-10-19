@@ -7,24 +7,27 @@ static const char *const TAG = "ups_hid";
 
 // -----------------------------------------------------
 // Estado simple + callbacks requeridos por IDF 5.4.x
+// (usamos handles globales para no tocar el .h)
 // -----------------------------------------------------
 static UpsHid *g_self = nullptr;
 static volatile bool g_probe_pending = false;   // lanzar descubrimiento fuera del callback
 static volatile bool g_start_listen = false;    // arrancar lectura EP IN fuera del callback
+
+// NUEVO: guardamos aquí la interfaz/endpoint abiertos sin modificar el .h
+static usb_host_interface_handle_t g_if_handle = nullptr;
+static usb_host_endpoint_handle_t  g_ep_in_handle = nullptr;
+static uint8_t g_hid_if = 0;  // nº de interfaz HID
 
 // callback no-op para transfers de control
 static void ctrl_transfer_cb_(usb_transfer_t *transfer) { (void)transfer; }
 
 // callback de la transferencia IN (endpoint interrupt)
 void in_transfer_cb_(usb_transfer_t *xfer) {
-  // Ojo: estamos en contexto de ISR/task del stack USB. Hacemos logs breves.
   if (!g_self) return;
   switch (xfer->status) {
     case USB_TRANSFER_STATUS_COMPLETED: {
-      // El payload empieza en data_buffer (no hay SETUP).
       const uint8_t *d = xfer->data_buffer;
       int n = xfer->actual_num_bytes;
-      // Log corto en hex (hasta 32 bytes para no saturar)
       int max_log = n < 32 ? n : 32;
       char buf[3 * 32 + 1];
       int k = 0;
@@ -33,7 +36,6 @@ void in_transfer_cb_(usb_transfer_t *xfer) {
         if (k >= (int)sizeof(buf)) break;
       }
       ESP_LOGI(TAG, "[in] report len=%d data=%s%s", n, buf, (n > max_log ? " ..." : ""));
-      // Volver a enviar para la siguiente lectura
       (void) usb_host_transfer_submit(g_self->in_xfer_);
       break;
     }
@@ -46,7 +48,6 @@ void in_transfer_cb_(usb_transfer_t *xfer) {
     case USB_TRANSFER_STATUS_CANCELED:
     default:
       ESP_LOGW(TAG, "[in] status=0x%X", (unsigned) xfer->status);
-      // Reintento suave si seguimos conectados
       if (g_self->dev_handle_ && g_self->listening_) {
         (void) usb_host_transfer_submit(g_self->in_xfer_);
       }
@@ -55,12 +56,13 @@ void in_transfer_cb_(usb_transfer_t *xfer) {
 }
 
 // -----------------------------------------------------
-// Helper: lee Configuration Descriptor, rellena ep_in/mps/interval y loguea
+// Helper: lee Configuration Descriptor, devuelve IF HID y EP IN
 // -----------------------------------------------------
 static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
                                                 usb_device_handle_t dev_handle,
-                                                uint8_t &ep_in, uint16_t &mps, uint8_t &interval) {
-  ep_in = 0; mps = 0; interval = 0;
+                                                uint8_t &if_num, uint8_t &ep_in,
+                                                uint16_t &mps, uint8_t &interval) {
+  if_num = 0; ep_in = 0; mps = 0; interval = 0;
   if (!client || !dev_handle) return false;
 
   // A) Header (9 bytes)
@@ -179,14 +181,15 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
     p += len;
   }
 
+  usb_host_transfer_free(xfull);
+
   if (hid_if >= 0 && ep_in != 0) {
+    if_num = (uint8_t) hid_if;
     ESP_LOGI(TAG, "[cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
              ep_in, (unsigned) mps, (unsigned) interval);
-    usb_host_transfer_free(xfull);
     return true;
   } else {
     ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID o endpoint IN.");
-    usb_host_transfer_free(xfull);
     return false;
   }
 }
@@ -196,7 +199,6 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
 // =====================================================
 
 void UpsHid::setup() {
-  // 1) Instalar librería USB Host
   usb_host_config_t cfg = {.skip_phy_setup = false, .intr_flags = 0};
   esp_err_t err = usb_host_install(&cfg);
   if (err == ESP_OK) {
@@ -206,11 +208,9 @@ void UpsHid::setup() {
     return;
   }
 
-  // 2) Tarea daemon de la librería
   xTaskCreatePinnedToCore(UpsHid::host_daemon_task_, "usbh_daemon",
                           4096, nullptr, 5, nullptr, tskNO_AFFINITY);
 
-  // 3) Registrar cliente asíncrono con callback
   usb_host_client_config_t client_cfg = {
       .is_synchronous = false,
       .max_num_event_msg = 8,
@@ -222,7 +222,6 @@ void UpsHid::setup() {
   err = usb_host_client_register(&client_cfg, &this->client_);
   if (err == ESP_OK) {
     ESP_LOGI(TAG, "USB Host client registered.");
-    // 4) Tarea que despacha eventos
     xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client",
                             4096, this, 5, nullptr, tskNO_AFFINITY);
   } else {
@@ -281,10 +280,11 @@ void UpsHid::client_task_(void *arg) {
 
     // 1) Descubrimiento HID (fuera del callback)
     if (g_probe_pending && self->dev_handle_ != nullptr) {
-      uint8_t ep; uint16_t mps; uint8_t itv;
-      if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, ep, mps, itv)) {
-        self->hid_ep_in_ = ep;
-        self->hid_ep_mps_ = mps;
+      uint8_t ifn, ep; uint16_t mps; uint8_t itv;
+      if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, ifn, ep, mps, itv)) {
+        g_hid_if            = ifn;
+        self->hid_ep_in_    = ep;
+        self->hid_ep_mps_   = mps;
         self->hid_ep_interval_ = itv;
         g_start_listen = true;  // listo para empezar lectura de reports
       }
@@ -293,28 +293,48 @@ void UpsHid::client_task_(void *arg) {
 
     // 2) Arrancar lectura continua del EP IN (una vez descubierto)
     if (g_start_listen && !self->listening_ && self->dev_handle_ != nullptr && self->hid_ep_in_ != 0) {
-      // Reservar/armar transfer
+      // 2.1) Claim interface si aún no la tenemos
+      if (g_if_handle == nullptr) {
+        esp_err_t cr = usb_host_interface_claim(self->client_, self->dev_handle_, g_hid_if, 0 /*alt_setting*/, &g_if_handle);
+        if (cr != ESP_OK) {
+          ESP_LOGW(TAG, "[in] interface_claim(IF=%u) failed: 0x%X", (unsigned) g_hid_if, (unsigned) cr);
+          g_start_listen = false;  // reintenta en próximo attach
+          continue;
+        }
+      }
+      // 2.2) Abrir endpoint IN si aún no está
+      if (g_ep_in_handle == nullptr) {
+        esp_err_t er = usb_host_endpoint_open(g_if_handle, self->hid_ep_in_, &g_ep_in_handle);
+        if (er != ESP_OK) {
+          ESP_LOGW(TAG, "[in] endpoint_open(0x%02X) failed: 0x%X", (unsigned) self->hid_ep_in_, (unsigned) er);
+          g_start_listen = false;  // reintenta en próximo attach
+          continue;
+        }
+      }
+      // 2.3) Reservar/armar transfer y enviar la primera lectura
       int size = self->hid_ep_mps_;
       if (size <= 0 || size > 64) size = 64;  // por seguridad
       if (self->in_xfer_ == nullptr) {
         if (usb_host_transfer_alloc(size, 0, &self->in_xfer_) != ESP_OK) {
           ESP_LOGW(TAG, "[in] transfer_alloc failed");
+          g_start_listen = false;
+          continue;
         }
       }
-      if (self->in_xfer_) {
-        self->in_xfer_->num_bytes = size;
-        self->in_xfer_->callback = in_transfer_cb_;
-        self->in_xfer_->context = nullptr;
-        self->in_xfer_->device_handle = self->dev_handle_;
-        self->in_xfer_->bEndpointAddress = self->hid_ep_in_;
-        self->in_xfer_->flags = 0;
-        esp_err_t se = usb_host_transfer_submit(self->in_xfer_);
-        if (se == ESP_OK) {
-          self->listening_ = true;
-          ESP_LOGI(TAG, "[in] listening on EP=0x%02X (MPS=%u, interval~%u ms)", self->hid_ep_in_, (unsigned) self->hid_ep_mps_, (unsigned) self->hid_ep_interval_);
-        } else {
-          ESP_LOGW(TAG, "[in] submit failed: 0x%X", (unsigned) se);
-        }
+      self->in_xfer_->num_bytes        = size;
+      self->in_xfer_->callback         = in_transfer_cb_;
+      self->in_xfer_->context          = nullptr;
+      self->in_xfer_->device_handle    = self->dev_handle_;
+      self->in_xfer_->bEndpointAddress = self->hid_ep_in_;
+      self->in_xfer_->flags            = 0;
+
+      esp_err_t se = usb_host_transfer_submit(self->in_xfer_);
+      if (se == ESP_OK) {
+        self->listening_ = true;
+        ESP_LOGI(TAG, "[in] listening on EP=0x%02X (MPS=%u, interval~%u ms)",
+                 self->hid_ep_in_, (unsigned) self->hid_ep_mps_, (unsigned) self->hid_ep_interval_);
+      } else {
+        ESP_LOGW(TAG, "[in] submit failed: 0x%X", (unsigned) se);
       }
       g_start_listen = false;
     }
@@ -327,12 +347,10 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
 
   switch (msg->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV: {
-      // Abrir el dispositivo y guardar addr/handle
       esp_err_t e = usb_host_device_open(self->client_, msg->new_dev.address, &self->dev_handle_);
       if (e == ESP_OK) {
         self->dev_addr_ = msg->new_dev.address;
         ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
-        // lanzamos descubrimiento fuera del callback
         g_probe_pending = true;
       } else {
         ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
@@ -343,9 +361,17 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
     case USB_HOST_CLIENT_EVENT_DEV_GONE: {
       // Parar lectura si estaba activa
       self->listening_ = false;
-      if (self->in_xfer_) {
-        // no liberamos aquí para evitar free en ISR; se puede reciclar al re-attach
+
+      // Cerrar EP e IF si estaban abiertos (globales de este .cpp)
+      if (g_ep_in_handle != nullptr) {
+        usb_host_endpoint_close(g_ep_in_handle);
+        g_ep_in_handle = nullptr;
       }
+      if (g_if_handle != nullptr) {
+        usb_host_interface_release(g_if_handle);
+        g_if_handle = nullptr;
+      }
+
       if (self->dev_handle_ != nullptr) {
         usb_host_device_close(self->client_, self->dev_handle_);
         self->dev_handle_ = nullptr;
