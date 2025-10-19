@@ -53,18 +53,19 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
     return false;
   }
 
-  {
-    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
-    while (xTaskGetTickCount() < dl &&
-           xhdr->status != USB_TRANSFER_STATUS_COMPLETED &&
-           xhdr->status != USB_TRANSFER_STATUS_ERROR &&
-           xhdr->status != USB_TRANSFER_STATUS_STALL &&
-           xhdr->status != USB_TRANSFER_STATUS_NO_DEVICE &&
-           xhdr->status != USB_TRANSFER_STATUS_CANCELED) {
-      vTaskDelay(pdMS_TO_TICKS(10));
+ {
+  TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+  while (xTaskGetTickCount() < dl) {
+    (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+    if (xhdr->status == USB_TRANSFER_STATUS_COMPLETED ||
+        xhdr->status == USB_TRANSFER_STATUS_ERROR ||
+        xhdr->status == USB_TRANSFER_STATUS_STALL ||
+        xhdr->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+        xhdr->status == USB_TRANSFER_STATUS_CANCELED) {
+      break;
     }
   }
-
+}
   if (xhdr->status != USB_TRANSFER_STATUS_COMPLETED) {
     ESP_LOGW(TAG, "[cfg] header status=0x%X", (unsigned) xhdr->status);
     usb_host_transfer_free(xhdr);
@@ -110,18 +111,19 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
     return false;
   }
 
-  {
-    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
-    while (xTaskGetTickCount() < dl &&
-           xfull->status != USB_TRANSFER_STATUS_COMPLETED &&
-           xfull->status != USB_TRANSFER_STATUS_ERROR &&
-           xfull->status != USB_TRANSFER_STATUS_STALL &&
-           xfull->status != USB_TRANSFER_STATUS_NO_DEVICE &&
-           xfull->status != USB_TRANSFER_STATUS_CANCELED) {
-      vTaskDelay(pdMS_TO_TICKS(10));
+{
+  TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+  while (xTaskGetTickCount() < dl) {
+    (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+    if (xfull->status == USB_TRANSFER_STATUS_COMPLETED ||
+        xfull->status == USB_TRANSFER_STATUS_ERROR ||
+        xfull->status == USB_TRANSFER_STATUS_STALL ||
+        xfull->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+        xfull->status == USB_TRANSFER_STATUS_CANCELED) {
+      break;
     }
   }
-
+}
   if (xfull->status != USB_TRANSFER_STATUS_COMPLETED) {
     ESP_LOGW(TAG, "[cfg] full status=0x%X", (unsigned) xfull->status);
     usb_host_transfer_free(xfull);
