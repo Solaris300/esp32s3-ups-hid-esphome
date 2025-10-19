@@ -18,6 +18,11 @@ static volatile bool g_poll_reports    = false;  // tras todo listo: empezar GET
 static uint8_t g_if_num = 0;                     // interfaz HID detectada
 
 // -----------------------------------------------------
+// Callback NO-OP requerido por IDF 5.4.x en transfers CTRL
+// -----------------------------------------------------
+static void ctrl_cb_(usb_transfer_t *t) { (void)t; }
+
+// -----------------------------------------------------
 // Utilidades: alloc + submit + wait (CTRL xfer)
 // -----------------------------------------------------
 static bool submit_ctrl_and_wait_(usb_host_client_handle_t client, usb_transfer_t *xfer, uint32_t timeout_ms) {
@@ -47,7 +52,7 @@ static bool alloc_setup_(int payload_len, usb_device_handle_t dev, usb_transfer_
   if (usb_host_transfer_alloc(total, 0, out_xfer) != ESP_OK) return false;
   usb_transfer_t *x = *out_xfer;
   x->num_bytes = total;
-  x->callback = nullptr;
+  x->callback = ctrl_cb_;            // <-- IDF 5.4.x exige callback no nulo
   x->context  = nullptr;
   x->device_handle    = dev;
   x->bEndpointAddress = 0x00; // EP0
@@ -160,7 +165,6 @@ static bool hid_get_report_descriptor_(usb_host_client_handle_t client,
   got_len = 0;
   if (!client || !dev || !out_buf || max_len <= 0) return false;
 
-  // Intento con 512 bytes (suele bastar para HID UPS)
   const int req_len = (max_len < 512) ? max_len : 512;
   usb_transfer_t *x = nullptr;
   if (!alloc_setup_(req_len, dev, &x)) {
@@ -169,10 +173,10 @@ static bool hid_get_report_descriptor_(usb_host_client_handle_t client,
   }
   {
     auto *s = (usb_setup_packet_t *) x->data_buffer;
-    s->bmRequestType = 0x81;                 // IN | Class | Interface
-    s->bRequest      = 0x06;                 // GET_DESCRIPTOR
+    s->bmRequestType = 0x81;                      // IN | Class | Interface
+    s->bRequest      = 0x06;                      // GET_DESCRIPTOR
     s->wValue        = (uint16_t)((0x22 << 8) | 0); // REPORT descriptor
-    s->wIndex        = if_num;               // interfaz HID
+    s->wIndex        = if_num;                    // interfaz HID
     s->wLength       = req_len;
   }
   bool ok = submit_ctrl_and_wait_(client, x, 2000);
@@ -181,7 +185,6 @@ static bool hid_get_report_descriptor_(usb_host_client_handle_t client,
     usb_host_transfer_free(x);
     return false;
   }
-  // Copia el payload
   int n = x->actual_num_bytes;
   if (n > req_len) n = req_len;
   if (n > max_len) n = max_len;
@@ -213,8 +216,7 @@ static bool hid_get_input_report_(usb_host_client_handle_t client,
     auto *s = (usb_setup_packet_t *) x->data_buffer;
     s->bmRequestType = 0xA1;                // IN | Class | Interface
     s->bRequest      = 0x01;                // GET_REPORT
-    // Alto: TYPE(1=Input), Bajo: REPORT ID (0 si no usa IDs)
-    s->wValue        = (uint16_t)((0x01 << 8) | report_id);
+    s->wValue        = (uint16_t)((0x01 << 8) | report_id); // TYPE=Input(1), ID
     s->wIndex        = if_num;
     s->wLength       = max_len;
   }
@@ -346,12 +348,12 @@ void UpsHid::client_task_(void *arg) {
       uint8_t buf[512];
       int n = 0;
       if (hid_get_report_descriptor_(self->client_, self->dev_handle_, g_if_num, buf, sizeof(buf), n)) {
-        // Log en hex acotado
+        // Log en hex acotado (32 bytes por línea)
         char line[3*32+1];
         int pos = 0;
         ESP_LOGI(TAG, "[rdesc] len=%d bytes", n);
         for (int i = 0; i < n; i++) {
-          pos += snprintf(line + (pos>= (int)sizeof(line) ? (int)sizeof(line)-1 : pos),
+          pos += snprintf(line + (pos >= (int)sizeof(line) ? (int)sizeof(line)-1 : pos),
                           sizeof(line) - pos, "%02X%s", buf[i],
                           ((i % 32)==31 || i==n-1) ? "" : " ");
           if ((i % 32) == 31 || i == n - 1) {
@@ -384,7 +386,7 @@ void UpsHid::client_task_(void *arg) {
             if (k >= (int)sizeof(buf)) break;
           }
           ESP_LOGI(TAG, "[poll] GET_REPORT len=%d data=%s%s", got, buf, (got > max_log ? " ..." : ""));
-          // TODO: aquí es donde mapearemos campos (voltaje, %bat, etc.) según tu descriptor
+          // TODO: aquí mapearemos campos (voltaje, %bat, etc.) según el descriptor
         }
       }
     }
