@@ -1,4 +1,6 @@
 #include "ups_hid.h"
+#include <cstring>              // memcpy
+#include "esp_timer.h"          // esp_timer_get_time
 #include "usb/usb_types_ch9.h"  // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
 
 namespace esphome {
@@ -7,7 +9,7 @@ namespace ups_hid {
 static const char *const TAG = "ups_hid";
 
 // -----------------------------------------------------
-// Estado simple + flags para trabajo fuera del callback
+// Estado simple + flag para trabajo fuera del callback
 // -----------------------------------------------------
 static UpsHid *g_self = nullptr;
 static volatile bool g_probe_pending = false;   // lanzar descubrimiento fuera del callback
@@ -134,6 +136,8 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   const uint8_t *p   = xfull->data_buffer + USB_SETUP_PACKET_SIZE;
   const uint8_t *end = p + payload;
   int hid_if = -1;
+  uint8_t ep_in = 0, interval = 0;
+  uint16_t mps = 0;
 
   while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
     uint8_t len = p[0], type = p[1];
@@ -160,13 +164,19 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
 
   usb_host_transfer_free(xfull);
 
-  if (hid_if >= 0 && ep_in != 0) {
-    if_num = (uint8_t) hid_if;
-    ESP_LOGI(TAG, "[cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
-             ep_in, (unsigned) mps, (unsigned) interval);
+  if (hid_if >= 0) {
+    if_num  = (uint8_t) hid_if;
+    if (ep_in != 0) {
+      mps       = (mps == 0 ? 8 : mps);
+      interval  = (interval == 0 ? 10 : interval);
+      ESP_LOGI(TAG, "[cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
+               ep_in, (unsigned) mps, (unsigned) interval);
+    } else {
+      ESP_LOGW(TAG, "[cfg] HID sin endpoint IN de interrupción (se usará poll por control)");
+    }
     return true;
   } else {
-    ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID o endpoint IN.");
+    ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID.");
     return false;
   }
 }
@@ -232,7 +242,7 @@ static bool hid_get_report_input_ctrl_(usb_host_client_handle_t client,
     got_len = x->actual_num_bytes - USB_SETUP_PACKET_SIZE;
     if (got_len < 0) got_len = 0;
     if (got_len > out_len) got_len = out_len;
-    memcpy(out_buf, d, got_len);
+    std::memcpy(out_buf, d, got_len);
     ok = true;
   } else {
     ESP_LOGV(TAG, "[poll] status=0x%X", (unsigned) x->status);
@@ -286,11 +296,11 @@ void UpsHid::dump_config() {
 }
 
 void UpsHid::update() {
-  // Poll ligero por control cada ~1s cuando hay dispositivo
-  static uint32_t last_ms = 0;
-  uint32_t now = millis();
-  if (this->dev_handle_ && this->hid_if_ >= 0 && (now - last_ms) > 1000) {
-    last_ms = now;
+  // Poll ligero por control cada ~1 s cuando hay dispositivo e interfaz HID
+  static uint64_t last_ms = 0;
+  uint64_t now_ms = (uint64_t) (esp_timer_get_time() / 1000ULL);
+  if (this->dev_handle_ && this->hid_if_ >= 0 && (now_ms - last_ms) > 1000ULL) {
+    last_ms = now_ms;
     uint8_t buf[32];
     int got = 0;
     // report_id 0 es lo más común en HID UPS genéricos
@@ -371,11 +381,11 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
     case USB_HOST_CLIENT_EVENT_NEW_DEV: {
       esp_err_t e = usb_host_device_open(self->client_, msg->new_dev.address, &self->dev_handle_);
       if (e == ESP_OK) {
-        self->dev_addr_ = msg->new_dev.address;
-        self->hid_if_   = -1;          // aún no detectado
-        self->hid_ep_in_ = 0;          // aún no detectado
+        self->dev_addr_   = msg->new_dev.address;
+        self->hid_if_     = -1;          // aún no detectado
+        self->hid_ep_in_  = 0;           // aún no detectado
         ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
-        g_probe_pending = true;        // lanzar descubrimiento
+        g_probe_pending = true;          // lanzar descubrimiento
       } else {
         ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
                  (unsigned) msg->new_dev.address, (unsigned) e);
