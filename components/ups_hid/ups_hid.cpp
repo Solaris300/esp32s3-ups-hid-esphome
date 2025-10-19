@@ -252,9 +252,6 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
         self->dev_addr_ = msg->new_dev.address;
         ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
 
-        // Descubrimiento de interfaz/endpoint HID (solo logs)
-        (void) read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_);
-
       } else {
         ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
                  (unsigned) msg->new_dev.address, (unsigned) e);
