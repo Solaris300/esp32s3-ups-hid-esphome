@@ -1,7 +1,11 @@
 #include "ups_hid.h"
-
+#include "usb/usb_types_ch9.h"  // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
 namespace esphome {
 namespace ups_hid {
+
+
+// Callback obligatorio para transfers en IDF 5.4.x
+static void ctrl_transfer_cb_(usb_transfer_t *transfer) { /* no-op */ }
 
 static const char *const TAG = "ups_hid";
 
