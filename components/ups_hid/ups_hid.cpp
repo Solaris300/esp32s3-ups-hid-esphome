@@ -24,7 +24,10 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
                                                 usb_device_handle_t dev_handle,
                                                 uint8_t &if_num, uint8_t &ep_in,
                                                 uint16_t &mps, uint8_t &interval) {
-  if_num = 0; ep_in = 0; mps = 0; interval = 0;
+  if_num = 0;
+  ep_in = 0;
+  mps = 0;
+  interval = 0;
   if (!client || !dev_handle) return false;
 
   // A) Header (9 bytes) de la config activa
@@ -136,8 +139,6 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   const uint8_t *p   = xfull->data_buffer + USB_SETUP_PACKET_SIZE;
   const uint8_t *end = p + payload;
   int hid_if = -1;
-  uint8_t ep_in = 0, interval = 0;
-  uint16_t mps = 0;
 
   while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
     uint8_t len = p[0], type = p[1];
@@ -167,8 +168,8 @@ static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
   if (hid_if >= 0) {
     if_num  = (uint8_t) hid_if;
     if (ep_in != 0) {
-      mps       = (mps == 0 ? 8 : mps);
-      interval  = (interval == 0 ? 10 : interval);
+      if (mps == 0) mps = 8;
+      if (interval == 0) interval = 10;
       ESP_LOGI(TAG, "[cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
                ep_in, (unsigned) mps, (unsigned) interval);
     } else {
@@ -359,14 +360,14 @@ void UpsHid::client_task_(void *arg) {
 
     // Descubrimiento HID (fuera del callback)
     if (g_probe_pending && self->dev_handle_ != nullptr) {
-      uint8_t ifn, ep; uint16_t mps; uint8_t itv;
-      if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, ifn, ep, mps, itv)) {
+      uint8_t ifn, ep; uint16_t m; uint8_t itv;
+      if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, ifn, ep, m, itv)) {
         self->hid_if_          = (int) ifn;   // guardamos nº de interfaz HID
         self->hid_ep_in_       = ep;
-        self->hid_ep_mps_      = mps;
+        self->hid_ep_mps_      = m;
         self->hid_ep_interval_ = itv;
         ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u",
-                 (unsigned) ifn, (unsigned) ep, (unsigned) mps, (unsigned) itv);
+                 (unsigned) ifn, (unsigned) ep, (unsigned) m, (unsigned) itv);
       }
       g_probe_pending = false;
     }
