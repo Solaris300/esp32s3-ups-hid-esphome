@@ -24,17 +24,19 @@ class UpsHid : public PollingComponent {
   static void client_task_(void *arg);
   static void client_callback_(const usb_host_client_event_msg_t *msg, void *arg);
 
-  // (Queda por si lo usamos más adelante)
-  bool read_device_descriptor_();
-
-  // Handles
+  // Handles y estado de dispositivo
   usb_host_client_handle_t client_{nullptr};
   usb_device_handle_t dev_handle_{nullptr};
   uint8_t dev_addr_{0};
 
-  // (Queda por si lo usamos más adelante)
-  usb_transfer_t *ctrl_xfer_{nullptr};
-  SemaphoreHandle_t ctrl_sem_{nullptr};
+  // Descubrimiento HID
+  uint8_t hid_ep_in_{0};        // p.ej. 0x81
+  uint16_t hid_ep_mps_{0};      // p.ej. 8
+  uint8_t hid_ep_interval_{0};  // p.ej. 10 (ms, orientativo)
+
+  // Lectura continua del endpoint
+  usb_transfer_t *in_xfer_{nullptr};
+  bool listening_{false};
 };
 
 }  // namespace ups_hid
