@@ -1,6 +1,6 @@
 #include "ups_hid.h"
 
-#include <cstring>  // memset
+#include <cstring>  // memcpy, memset, snprintf
 
 namespace esphome {
 namespace ups_hid {
@@ -16,7 +16,7 @@ static UpsHid *g_self = nullptr;
 static void ctrl_transfer_cb_(usb_transfer_t *transfer) { (void) transfer; }
 
 // =====================================================
-// Helpers de control transfer
+/* Helpers de control transfer */
 // =====================================================
 
 bool UpsHid::get_config_header_(usb_host_client_handle_t client, usb_device_handle_t dev, uint8_t *cfg_hdr_out_9) {
@@ -136,7 +136,6 @@ bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client
   if_num = 0xFF; ep_in = 0; mps = 0; interval = 0; rdesc_len = 0;
   if (!client || !dev_handle) return false;
 
-  // Buffer razonable para la configuración
   uint8_t cfg[512];
   int cfg_len = 0;
   if (!get_full_config_(client, dev_handle, cfg, sizeof(cfg), cfg_len)) {
@@ -144,7 +143,6 @@ bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client
     return false;
   }
 
-  // Parseo
   const uint8_t *p = cfg;
   const uint8_t *end = cfg + cfg_len;
   int current_if = -1;
@@ -162,14 +160,8 @@ bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client
       }
     } else if (type == 0x21 /*HID*/ && len >= 6) {
       if (if_num != 0xFF && current_if == (int) if_num) {
-        // Buscar Report Descriptor length dentro de HID descriptor
-        // Formato: bDescriptorType=0x21, luego bcdHID, bCountryCode, bNumDescriptors,
-        // seguido de (bReportDescriptorType=0x22, wDescriptorLength)
-        if (len >= 9) {
-          // Normalmente: ... 0x22, LSB, MSB
-          if (p[5] == 0x22) {
-            rdesc_len = (uint16_t)(p[6] | (p[7] << 8));
-          }
+        if (len >= 9 && p[5] == 0x22) {  // Report descriptor type
+          rdesc_len = (uint16_t)(p[6] | (p[7] << 8));
         }
       }
     } else if (type == 5 /*ENDPOINT*/ && len >= 7) {
@@ -189,9 +181,7 @@ bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client
     p += len;
   }
 
-  if (if_num != 0xFF && ep_in != 0) {
-    return true;
-  }
+  if (if_num != 0xFF && ep_in != 0) return true;
   ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID o endpoint IN.");
   return false;
 }
@@ -250,9 +240,7 @@ bool UpsHid::get_report_descriptor_(usb_host_client_handle_t client, usb_device_
 
 void UpsHid::dump_report_descriptor_(const uint8_t *buf, int len) {
   if (!buf || len <= 0) return;
-
   ESP_LOGI(TAG, "[rdesc] len=%d bytes", len);
-  // trocear en líneas de 16 bytes para no saturar el logger
   for (int i = 0; i < len; i += 16) {
     char line[3 * 16 + 1];
     int k = 0;
@@ -262,12 +250,12 @@ void UpsHid::dump_report_descriptor_(const uint8_t *buf, int len) {
       if (k >= (int) sizeof(line)) break;
     }
     ESP_LOGI(TAG, "[rdesc] %s", line);
-    // Aviso: si el logger avisa de “took a long time”, podemos bajar a 8 bytes por línea
   }
 }
 
 bool UpsHid::hid_get_report_input_ctrl_(usb_host_client_handle_t client, usb_device_handle_t dev_handle,
-                                        uint8_t report_id, uint8_t *out_buf, int out_cap, int &out_len) {
+                                        uint8_t if_num, uint8_t report_id,
+                                        uint8_t *out_buf, int out_cap, int &out_len) {
   out_len = 0;
   if (!client || !dev_handle || !out_buf || out_cap <= 0) return false;
 
@@ -280,7 +268,7 @@ bool UpsHid::hid_get_report_input_ctrl_(usb_host_client_handle_t client, usb_dev
   setup->bmRequestType = 0xA1;               // IN | Class | Interface
   setup->bRequest      = 0x01;               // GET_REPORT
   setup->wValue        = (uint16_t)((0x01 /*Input*/ << 8) | report_id);
-  setup->wIndex        = this->hid_if_;      // interface actual
+  setup->wIndex        = if_num;             // *** YA NO USAMOS this ***
   setup->wLength       = out_cap;
 
   x->num_bytes        = tot_len;
@@ -323,7 +311,6 @@ bool UpsHid::hid_get_report_input_ctrl_(usb_host_client_handle_t client, usb_dev
 // =====================================================
 
 void UpsHid::setup() {
-  // 1) Instalar librería USB Host
   usb_host_config_t cfg = {.skip_phy_setup = false, .intr_flags = 0};
   esp_err_t err = usb_host_install(&cfg);
   if (err == ESP_OK) {
@@ -333,11 +320,9 @@ void UpsHid::setup() {
     return;
   }
 
-  // 2) Tarea daemon de la librería
   xTaskCreatePinnedToCore(UpsHid::host_daemon_task_, "usbh_daemon",
                           4096, nullptr, 5, nullptr, tskNO_AFFINITY);
 
-  // 3) Registrar cliente asíncrono con callback
   usb_host_client_config_t client_cfg = {
       .is_synchronous = false,
       .max_num_event_msg = 8,
@@ -393,31 +378,32 @@ void UpsHid::client_task_(void *arg) {
     return;
   }
 
-  uint32_t last_tick = xTaskGetTickCount();
+  TickType_t last_tick = xTaskGetTickCount();
 
   while (true) {
-    // 1) Despachar eventos del cliente
     esp_err_t err = usb_host_client_handle_events(self->client_, pdMS_TO_TICKS(100));
     if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
       ESP_LOGW(TAG, "[usbh_client] handle_events err=0x%X", (unsigned) err);
     }
 
-    // 2) Si toca “probe” (tras NEW_DEV), descubre HID y endpoint
+    // Descubrimiento tras NEW_DEV
     if (self->probe_pending_ && self->dev_handle_ != nullptr) {
       uint8_t if_num; uint8_t ep_in; uint16_t mps; uint8_t interval; uint16_t rdlen;
       if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_, if_num, ep_in, mps, interval, rdlen)) {
-        self->hid_if_          = if_num;
-        self->hid_ep_in_       = ep_in;
-        self->hid_ep_mps_      = mps;
-        self->hid_ep_interval_ = interval;
+        self->hid_if_              = if_num;
+        self->hid_ep_in_           = ep_in;
+        self->hid_ep_mps_          = mps;
+        self->hid_ep_interval_     = interval;
         self->hid_report_desc_len_ = rdlen;
-        ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u", (unsigned) self->hid_if_,
-                 (unsigned) self->hid_ep_in_, (unsigned) self->hid_ep_mps_, (unsigned) self->hid_ep_interval_);
 
-        // Volcado (único) del Report Descriptor al conectar
+        ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u",
+                 (unsigned) self->hid_if_, (unsigned) self->hid_ep_in_,
+                 (unsigned) self->hid_ep_mps_, (unsigned) self->hid_ep_interval_);
+
+        // Dump report descriptor una vez
         if (!self->rdump_done_) {
           int want = (self->hid_report_desc_len_ > 0) ? self->hid_report_desc_len_ : 512;
-          if (want > 1024) want = 1024;  // límite de seguridad
+          if (want > 1024) want = 1024;
           uint8_t *tmp = (uint8_t *) heap_caps_malloc(want, MALLOC_CAP_8BIT);
           if (tmp) {
             int got = 0;
@@ -428,26 +414,23 @@ void UpsHid::client_task_(void *arg) {
           }
           self->rdump_done_ = true;
         }
-
-        self->last_poll_ms_ = 0;  // fuerza primer sondeo ya
       }
       self->probe_pending_ = false;
     }
 
-    // 3) Sondeo periódico por control transfer (1 Hz aprox.)
+    // Sondeo ~1 Hz
     TickType_t now_tick = xTaskGetTickCount();
     if (self->dev_handle_ != nullptr && self->hid_if_ != 0xFF &&
         (now_tick - last_tick) >= pdMS_TO_TICKS(1000)) {
       last_tick = now_tick;
 
-      // IDs que hemos visto en tus logs: 0x01, 0x64, 0x66
       const uint8_t ids[] = {0x01, 0x64, 0x66};
       uint8_t buf[64];
       for (uint8_t id : ids) {
         int got = 0;
         memset(buf, 0, sizeof(buf));
-        if (self->hid_get_report_input_ctrl_(self->client_, self->dev_handle_, id, buf, sizeof(buf), got) && got > 0) {
-          // Log compacto (hasta 64 bytes)
+        if (UpsHid::hid_get_report_input_ctrl_(self->client_, self->dev_handle_, self->hid_if_, id,
+                                               buf, sizeof(buf), got) && got > 0) {
           char line[3 * 64 + 1];
           int k = 0;
           for (int i = 0; i < got; i++) {
@@ -455,10 +438,7 @@ void UpsHid::client_task_(void *arg) {
             if (k >= (int) sizeof(line)) break;
           }
           ESP_LOGI(TAG, "[poll] GET_REPORT id=0x%02X len=%d data=%s", (unsigned) id, got, line);
-
-          // TODO: aquí parsearemos y publicaremos sensores.
-          // Ejemplo (ficticio): si buf[2..3] = tensión * 0.1 V => voltage = u16le(buf+2) * 0.1
-          // Luego voltage_sensor_->publish_state(voltage);
+          // TODO: parseo y publicación de sensores
         }
       }
     }
