@@ -8,6 +8,7 @@
 #include "usb/usb_host.h"
 #include "usb/usb_types_ch9.h"   // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
 #include <cstring>
+#include <functional>
 
 namespace esphome {
 namespace ups_hid {
@@ -17,7 +18,7 @@ class UpsHid : public Component {
   void setup() override;
   void dump_config() override;
 
-  // usaremos set_interval desde main.cpp para el polling
+  // Opción para quien quiera programar callbacks temporizados desde main.cpp
   void set_interval(uint32_t interval_ms, std::function<void()> &&f) {
     this->interval_ = interval_ms;
     this->interval_cb_ = std::move(f);
@@ -40,10 +41,6 @@ class UpsHid : public Component {
 
   // Banderas para trabajo fuera del callback
   volatile bool probe_pending_{false};
-
-  // Buffer de trabajo para GET_DESCRIPTOR / GET_REPORT
-  // (se asignan y liberan en cada operación; no persistentes)
-  // ----
 
   // Ring buffer simple de últimos reportes por ID (para depurar)
   static constexpr int MAX_STORED_REPORT = 8;
@@ -80,7 +77,7 @@ class UpsHid : public Component {
   static void log_hex_line_(const char *prefix, const uint8_t *data, int len);
   void       store_last_report_(uint8_t report_id, const uint8_t *data, int len);
 
-  // Intervalo “virtual” para permitir set_interval desde main.cpp
+  // Intervalo “virtual” para permitir set_interval desde main.cpp (opcional)
   uint32_t interval_{0};
   std::function<void()> interval_cb_{};
 };
