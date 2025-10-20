@@ -1,5 +1,6 @@
 #include "ups_hid.h"
 #include "usb/usb_types_ch9.h"  // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
+#include "esp_timer.h"          // esp_timer_get_time
 
 namespace esphome {
 namespace ups_hid {
@@ -39,10 +40,32 @@ void UpsHid::store_last_report_(uint8_t report_id, const uint8_t *data, int len)
 }
 
 // ------------------------------------------
-// Control transfers: Config Descriptor (HID IF/EP) y Report Descriptor
+// Helper común de espera de control transfer
+// Espera hasta COMPLETED o error conocido (compat IDF sin *_NOT_READY)
 // ------------------------------------------
+static bool wait_ctrl_done_(usb_host_client_handle_t client,
+                            usb_transfer_t *xfer,
+                            uint32_t timeout_ms) {
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  while (xTaskGetTickCount() < deadline) {
+    (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED ||
+        xfer->status == USB_TRANSFER_STATUS_ERROR ||
+        xfer->status == USB_TRANSFER_STATUS_STALL ||
+        xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+        xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+      return (xfer->status == USB_TRANSFER_STATUS_COMPLETED);
+    }
+  }
+  // timeout: no cambió a un estado terminal conocido
+  return false;
+}
+
 static void ctrl_noop_cb(usb_transfer_t *t) { (void)t; }
 
+// ------------------------------------------
+// Control transfers: Config Descriptor (HID IF/EP) y Report Descriptor
+// ------------------------------------------
 bool UpsHid::read_config_descriptor_and_log_hid_(
     usb_host_client_handle_t client,
     usb_device_handle_t dev_handle,
@@ -83,15 +106,8 @@ bool UpsHid::read_config_descriptor_and_log_hid_(
     return false;
   }
 
-  // Espera con bombeo de eventos
-  {
-    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
-    while (xTaskGetTickCount() < dl) {
-      (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
-      if (xhdr->status != USB_TRANSFER_STATUS_NOT_READY) break;
-    }
-  }
-  if (xhdr->status != USB_TRANSFER_STATUS_COMPLETED) {
+  bool ok_hdr = wait_ctrl_done_(client, xhdr, 1000);
+  if (!ok_hdr) {
     ESP_LOGW(TAG, "[cfg] header status=0x%X", (unsigned) xhdr->status);
     usb_host_transfer_free(xhdr);
     return false;
@@ -137,14 +153,8 @@ bool UpsHid::read_config_descriptor_and_log_hid_(
     return false;
   }
 
-  {
-    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
-    while (xTaskGetTickCount() < dl) {
-      (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
-      if (xf->status != USB_TRANSFER_STATUS_NOT_READY) break;
-    }
-  }
-  if (xf->status != USB_TRANSFER_STATUS_COMPLETED) {
+  bool ok_full = wait_ctrl_done_(client, xf, 1500);
+  if (!ok_full) {
     ESP_LOGW(TAG, "[cfg] full status=0x%X", (unsigned) xf->status);
     usb_host_transfer_free(xf);
     return false;
@@ -201,11 +211,10 @@ bool UpsHid::dump_report_descriptor_chunked_(
   out_len = 0;
   if (!client || !dev_handle) return false;
 
-  // GET_DESCRIPTOR (class, interface) -> Report Descriptor (0x22)
-  const int MAX_RD = 1024; // por si acaso
-  int req = 512;           // tu UPS reportó ~512–604 B; pedimos 512 de inicio
-
+  // GET_DESCRIPTOR (class/interface) -> Report Descriptor (0x22)
+  int req = 512;  // tu UPS suele dar 512–604; si se quedara corto, podremos aumentar en una segunda pasada
   int total = USB_SETUP_PACKET_SIZE + req;
+
   usb_transfer_t *x = nullptr;
   if (usb_host_transfer_alloc(total, 0, &x) != ESP_OK) {
     ESP_LOGW(TAG, "[rdesc] alloc failed");
@@ -232,14 +241,8 @@ bool UpsHid::dump_report_descriptor_chunked_(
     return false;
   }
 
-  {
-    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
-    while (xTaskGetTickCount() < dl) {
-      (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
-      if (x->status != USB_TRANSFER_STATUS_NOT_READY) break;
-    }
-  }
-  if (x->status != USB_TRANSFER_STATUS_COMPLETED) {
+  bool ok = wait_ctrl_done_(client, x, 1500);
+  if (!ok) {
     ESP_LOGW(TAG, "[rdesc] status=0x%X", (unsigned) x->status);
     usb_host_transfer_free(x);
     return false;
@@ -252,11 +255,10 @@ bool UpsHid::dump_report_descriptor_chunked_(
 
   const uint8_t *rd = x->data_buffer + USB_SETUP_PACKET_SIZE;
 
-  // Log chunked: 16 bytes por línea + yield
+  // Log chunked: 16 bytes por línea + yields cortos
   for (int i = 0; i < got; i += 16) {
     int n = (got - i) > 16 ? 16 : (got - i);
     log_hex_line_("[rdesc]", rd + i, n);
-    // pequeña pausa para no bloquear y que el logger no “regañe”
     vTaskDelay(pdMS_TO_TICKS(2));
   }
 
@@ -274,8 +276,7 @@ bool UpsHid::hid_get_report_input_ctrl_(
   out_len = 0;
   if (!client || !dev_handle || !out_buf || out_cap <= 0) return false;
 
-  // Protocol HID: GET_REPORT (Input), report ID en high byte de wValue
-  // bmRequestType: 0xA1 (IN | Class | Interface)
+  // HID GET_REPORT(Input)
   const int want = out_cap;
   const int total = USB_SETUP_PACKET_SIZE + want;
 
@@ -286,10 +287,10 @@ bool UpsHid::hid_get_report_input_ctrl_(
   }
 
   usb_setup_packet_t *sp = (usb_setup_packet_t *) x->data_buffer;
-  sp->bmRequestType = 0xA1;
-  sp->bRequest      = 0x01; // GET_REPORT
-  sp->wValue        = (uint16_t)((0x01 << 8) | report_id); // 0x01: Input
-  sp->wIndex        = hid_if;
+  sp->bmRequestType = 0xA1;      // IN | Class | Interface
+  sp->bRequest      = 0x01;      // GET_REPORT
+  sp->wValue        = (uint16_t)((0x01 << 8) | report_id); // 0x01 Input
+  sp->wIndex        = hid_if;    // interfaz HID
   sp->wLength       = want;
 
   x->num_bytes = total;
@@ -305,15 +306,7 @@ bool UpsHid::hid_get_report_input_ctrl_(
     return false;
   }
 
-  {
-    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(500);
-    while (xTaskGetTickCount() < dl) {
-      (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(5));
-      if (x->status != USB_TRANSFER_STATUS_NOT_READY) break;
-    }
-  }
-
-  bool ok = (x->status == USB_TRANSFER_STATUS_COMPLETED);
+  bool ok = wait_ctrl_done_(client, x, 500);
   if (ok) {
     int got = x->actual_num_bytes - USB_SETUP_PACKET_SIZE;
     if (got < 0) got = 0;
@@ -445,7 +438,7 @@ void UpsHid::client_task_(void *arg) {
         if (hid_get_report_input_ctrl_(self->client_, self->dev_handle_,
                                        rid, buf, sizeof(buf), got, self->hid_if_)) {
           if (got > 0) {
-            // log compacto (64 bytes, 1 línea)
+            // log compacto (hasta 32 bytes)
             char line[3 * 32 + 1];
             int k = 0;
             int tolog = got > 32 ? 32 : got;
@@ -456,7 +449,7 @@ void UpsHid::client_task_(void *arg) {
             ESP_LOGI(TAG, "[poll] GET_REPORT id=0x%02X len=%d data=%s%s",
                      rid, got, line, (got > tolog ? " ..." : ""));
             self->store_last_report_(rid, buf, got);
-            // TODO: aquí después añadimos el parser real por campos
+            // TODO: aquí añadiremos el parser real por campos
           }
         }
       }
