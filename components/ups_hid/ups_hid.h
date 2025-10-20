@@ -27,13 +27,16 @@ class UpsHid : public Component {
   static bool get_config_header_(usb_host_client_handle_t client, usb_device_handle_t dev, uint8_t *cfg_hdr_out_9);
   static bool get_full_config_(usb_host_client_handle_t client, usb_device_handle_t dev, uint8_t *buf, int buf_len, int &out_len);
   static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client, usb_device_handle_t dev_handle,
-                                                  uint8_t &if_num, uint8_t &ep_in, uint16_t &mps, uint8_t &interval, uint16_t &rdesc_len);
+                                                  uint8_t &if_num, uint8_t &ep_in,
+                                                  uint16_t &mps, uint8_t &interval, uint16_t &rdesc_len);
   static bool get_report_descriptor_(usb_host_client_handle_t client, usb_device_handle_t dev_handle, uint8_t if_num,
                                      uint8_t *buf, int buf_len, int &out_len);
   static void dump_report_descriptor_(const uint8_t *buf, int len);
 
+  // ¡Cambio aquí!: pasamos también el if_num para no usar `this` en estática
   static bool hid_get_report_input_ctrl_(usb_host_client_handle_t client, usb_device_handle_t dev_handle,
-                                         uint8_t report_id, uint8_t *out_buf, int out_cap, int &out_len);
+                                         uint8_t if_num, uint8_t report_id,
+                                         uint8_t *out_buf, int out_cap, int &out_len);
 
   // ---------- Estado ----------
   usb_host_client_handle_t client_{nullptr};
@@ -54,9 +57,7 @@ class UpsHid : public Component {
   // Sondeo periódico
   uint32_t last_poll_ms_{0};
 
-  // ---- NOTA: Próximo paso ----
-  // Aquí añadiremos sensores (sensor::Sensor*, binary_sensor::BinarySensor*, etc.)
-  // y un parser específico de los reports para publicar a Home Assistant.
+  // (Próximo paso: sensores y parser de reports)
 };
 
 }  // namespace ups_hid
