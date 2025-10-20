@@ -12,10 +12,13 @@
 namespace esphome {
 namespace ups_hid {
 
-class UpsHid : public Component {
+class UpsHid : public PollingComponent {
  public:
   void setup() override;
   void dump_config() override;
+
+  // Mantener compatibilidad con main.cpp (no lo usaremos realmente)
+  void update() override {}  // no hace nada; el sondeo real está en client_task_
 
  private:
   // ---------- Tareas / callbacks ----------
@@ -33,7 +36,7 @@ class UpsHid : public Component {
                                      uint8_t *buf, int buf_len, int &out_len);
   static void dump_report_descriptor_(const uint8_t *buf, int len);
 
-  // ¡Cambio aquí!: pasamos también el if_num para no usar `this` en estática
+  // Pasamos if_num como argumento (evita usar `this` en estática)
   static bool hid_get_report_input_ctrl_(usb_host_client_handle_t client, usb_device_handle_t dev_handle,
                                          uint8_t if_num, uint8_t report_id,
                                          uint8_t *out_buf, int out_cap, int &out_len);
@@ -53,9 +56,6 @@ class UpsHid : public Component {
   // Flags de trabajo (se resuelven en client_task_)
   bool probe_pending_{false};  // tras NEW_DEV
   bool rdump_done_{false};     // ya se volcó el Report Descriptor en esta conexión
-
-  // Sondeo periódico
-  uint32_t last_poll_ms_{0};
 
   // (Próximo paso: sensores y parser de reports)
 };
