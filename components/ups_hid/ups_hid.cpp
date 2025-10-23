@@ -1,89 +1,78 @@
 #include "ups_hid.h"
-#include <cstring>
+#include "usb/usb_types_ch9.h"  // usb_setup_packet_t, USB_SETUP_PACKET_SIZE
+#include <cstring>              // memcpy, memset, snprintf
 
 namespace esphome {
 namespace ups_hid {
 
 static const char *const TAG = "ups_hid";
 
-// Flags estáticos
-volatile bool UpsHid::g_probe_pending_   = false;
-volatile bool UpsHid::g_polling_enabled_ = false;
+// -----------------------------------------------------
+// Estado simple para coordinar con el callback del cliente
+// -----------------------------------------------------
+static UpsHid *g_self = nullptr;
+static volatile bool g_probe_pending = false;    // lanzar descubrimiento fuera del callback
+
+// callback no-op para transfers de control
+static void ctrl_transfer_cb_(usb_transfer_t *transfer) { (void) transfer; }
 
 // -----------------------------------------------------
-// Pequeña utilidad para callbacks de control (no-op)
-static void ctrl_transfer_cb_(usb_transfer_t *x) { (void)x; }
-
-// log chunk en hex (corto)
-void UpsHid::log_hex_prefix_(const char *prefix, const uint8_t *d, int n, int max_bytes) {
-  if (n <= 0) {
-    ESP_LOGI(TAG, "%s len=0", prefix);
-    return;
-  }
-  if (max_bytes <= 0) max_bytes = n;
-  if (max_bytes > n) max_bytes = n;
-
-  char line[3 * 64 + 16];
-  int k = 0;
-  for (int i = 0; i < max_bytes; i++) {
-    if (k + 4 >= (int)sizeof(line)) break;
-    k += snprintf(line + k, sizeof(line) - k, "%02X%s", d[i], (i + 1 < max_bytes ? " " : ""));
-  }
-  ESP_LOGI(TAG, "%s len=%d data=%s%s", prefix, n, line, (n > max_bytes ? " ..." : ""));
-}
-
-// -----------------------------------------------------
-// Lee el descriptor de configuración y localiza HID IF + EP IN
+// Helper: lee Configuration Descriptor, saca IF HID y EP IN interrupt
+//         y obtiene la longitud del Report Descriptor (wDescriptorLength)
 // -----------------------------------------------------
 bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
                                                  usb_device_handle_t dev_handle,
                                                  uint8_t &if_num, uint8_t &ep_in,
                                                  uint16_t &mps, uint8_t &interval,
-                                                 uint16_t &total_cfg_len) {
-  if_num   = 0xFF;
-  ep_in    = 0;
-  mps      = 0;
-  interval = 0;
-  total_cfg_len = 0;
-
+                                                 uint16_t &rdesc_len) {
+  if_num = 0xFF; ep_in = 0; mps = 0; interval = 0; rdesc_len = 0;
   if (!client || !dev_handle) return false;
 
-  // 1) Header (9 bytes)
+  // A) Leer cabecera (9 bytes) del descriptor de configuración
   const int hdr_len = 9;
-  const int tot_hdr = USB_SETUP_PACKET_SIZE + hdr_len;
+  const int hdr_tot = USB_SETUP_PACKET_SIZE + hdr_len;
 
   usb_transfer_t *xhdr = nullptr;
-  if (usb_host_transfer_alloc(tot_hdr, 0, &xhdr) != ESP_OK) {
+  if (usb_host_transfer_alloc(hdr_tot, 0, &xhdr) != ESP_OK) {
     ESP_LOGW(TAG, "[cfg] transfer_alloc header failed");
     return false;
   }
-  {
-    auto *s = reinterpret_cast<usb_setup_packet_t *>(xhdr->data_buffer);
-    s->bmRequestType = 0x80; // IN, device
-    s->bRequest      = 0x06; // GET_DESCRIPTOR
-    s->wValue        = (uint16_t)((2 << 8) | 0); // CONFIGURATION 0
-    s->wIndex        = 0;
-    s->wLength       = hdr_len;
 
-    xhdr->num_bytes        = tot_hdr;
-    xhdr->callback         = ctrl_transfer_cb_;
-    xhdr->context          = nullptr;
-    xhdr->device_handle    = dev_handle;
-    xhdr->bEndpointAddress = 0x00;
-    xhdr->flags            = 0;
-  }
+  usb_setup_packet_t *sh = reinterpret_cast<usb_setup_packet_t *>(xhdr->data_buffer);
+  sh->bmRequestType = 0x80;  // IN, Standard, Device
+  sh->bRequest      = 0x06;  // GET_DESCRIPTOR
+  sh->wValue        = static_cast<uint16_t>((2 << 8) | 0);  // CONFIGURATION (type=2, index=0)
+  sh->wIndex        = 0;
+  sh->wLength       = hdr_len;
+
+  xhdr->num_bytes         = hdr_tot;
+  xhdr->callback          = ctrl_transfer_cb_;
+  xhdr->context           = nullptr;
+  xhdr->device_handle     = dev_handle;
+  xhdr->bEndpointAddress  = 0x00;
+  xhdr->flags             = 0;
+
   if (usb_host_transfer_submit_control(client, xhdr) != ESP_OK) {
     ESP_LOGW(TAG, "[cfg] submit header failed");
     usb_host_transfer_free(xhdr);
     return false;
   }
+
   {
     TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
     while (xTaskGetTickCount() < dl) {
       (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
-      if (xhdr->status != USB_TRANSFER_STATUS_IDLE) break;
+      // Espera hasta estado terminal (compatibilidad IDF)
+      if (xhdr->status == USB_TRANSFER_STATUS_COMPLETED ||
+          xhdr->status == USB_TRANSFER_STATUS_ERROR ||
+          xhdr->status == USB_TRANSFER_STATUS_STALL ||
+          xhdr->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+          xhdr->status == USB_TRANSFER_STATUS_CANCELED) {
+        break;
+      }
     }
   }
+
   if (xhdr->status != USB_TRANSFER_STATUS_COMPLETED) {
     ESP_LOGW(TAG, "[cfg] header status=0x%X", (unsigned) xhdr->status);
     usb_host_transfer_free(xhdr);
@@ -96,11 +85,10 @@ bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client
     usb_host_transfer_free(xhdr);
     return false;
   }
-  uint16_t wTotalLength = (uint16_t)(cfg_hdr[2] | (cfg_hdr[3] << 8));
+  uint16_t wTotalLength = static_cast<uint16_t>(cfg_hdr[2] | (cfg_hdr[3] << 8));
   usb_host_transfer_free(xhdr);
 
-  // 2) Descriptor completo
-  total_cfg_len = wTotalLength;
+  // B) Leer descriptor completo
   int payload = wTotalLength;
   int total   = USB_SETUP_PACKET_SIZE + payload;
 
@@ -109,50 +97,59 @@ bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client
     ESP_LOGW(TAG, "[cfg] transfer_alloc full failed");
     return false;
   }
-  {
-    auto *s = reinterpret_cast<usb_setup_packet_t *>(xf->data_buffer);
-    s->bmRequestType = 0x80;
-    s->bRequest      = 0x06; // GET_DESCRIPTOR
-    s->wValue        = (uint16_t)((2 << 8) | 0);
-    s->wIndex        = 0;
-    s->wLength       = payload;
 
-    xf->num_bytes        = total;
-    xf->callback         = ctrl_transfer_cb_;
-    xf->context          = nullptr;
-    xf->device_handle    = dev_handle;
-    xf->bEndpointAddress = 0x00;
-    xf->flags            = 0;
-  }
+  usb_setup_packet_t *sf = reinterpret_cast<usb_setup_packet_t *>(xf->data_buffer);
+  sf->bmRequestType = 0x80;  // IN, Standard, Device
+  sf->bRequest      = 0x06;  // GET_DESCRIPTOR
+  sf->wValue        = static_cast<uint16_t>((2 << 8) | 0);  // CONFIGURATION
+  sf->wIndex        = 0;
+  sf->wLength       = payload;
+
+  xf->num_bytes         = total;
+  xf->callback          = ctrl_transfer_cb_;
+  xf->context           = nullptr;
+  xf->device_handle     = dev_handle;
+  xf->bEndpointAddress  = 0x00;
+  xf->flags             = 0;
+
   if (usb_host_transfer_submit_control(client, xf) != ESP_OK) {
     ESP_LOGW(TAG, "[cfg] submit full failed");
     usb_host_transfer_free(xf);
     return false;
   }
+
   {
-    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
     while (xTaskGetTickCount() < dl) {
       (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
-      if (xf->status != USB_TRANSFER_STATUS_IDLE) break;
+      // Espera hasta estado terminal
+      if (xf->status == USB_TRANSFER_STATUS_COMPLETED ||
+          xf->status == USB_TRANSFER_STATUS_ERROR ||
+          xf->status == USB_TRANSFER_STATUS_STALL ||
+          xf->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+          xf->status == USB_TRANSFER_STATUS_CANCELED) {
+        break;
+      }
     }
   }
+
   if (xf->status != USB_TRANSFER_STATUS_COMPLETED) {
     ESP_LOGW(TAG, "[cfg] full status=0x%X", (unsigned) xf->status);
     usb_host_transfer_free(xf);
     return false;
   }
 
-  // 3) Parseo de IF/EP
+  // C) Parseo del descriptor: localizar INTERFACE HID + su ENDPOINT IN interrupt
   const uint8_t *p   = xf->data_buffer + USB_SETUP_PACKET_SIZE;
   const uint8_t *end = p + payload;
 
   int hid_if = -1;
-  uint8_t found_ep_in = 0;
-  uint16_t found_mps = 0;
-  uint8_t found_itv = 0;
+  uint16_t hid_rdesc_len = 0;
 
   while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
-    uint8_t len = p[0], type = p[1];
+    uint8_t len  = p[0];
+    uint8_t type = p[1];
+
     if (type == 4 && len >= 9) {  // INTERFACE
       uint8_t bInterfaceNumber = p[2];
       uint8_t bClass = p[5], bSub = p[6], bProto = p[7];
@@ -161,266 +158,224 @@ bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client
         ESP_LOGI(TAG, "[cfg] HID IF=%d class=0x%02X sub=0x%02X proto=0x%02X",
                  (int) bInterfaceNumber, bClass, bSub, bProto);
       }
-    } else if (type == 5 && len >= 7 && hid_if >= 0 && found_ep_in == 0) { // ENDPOINT
+    } else if (type == 0x21 && len >= 9 && hid_if >= 0 && hid_rdesc_len == 0) {
+      // HID descriptor: bLength, bDescriptorType(0x21), bcdHID(2), bCountry, bNumDesc,
+      //                {bDescType(0x22), wDescLength(2)}, ...
+      uint8_t bNumDesc = p[5];
+      const uint8_t *q = p + 6;
+      for (uint8_t i = 0; i < bNumDesc; i++) {
+        if (q + 3 <= p + len) {
+          uint8_t  dt  = q[0];
+          uint16_t dln = (uint16_t)(q[1] | (q[2] << 8));
+          if (dt == 0x22 && dln > 0) {  // Report Descriptor
+            hid_rdesc_len = dln;
+            break;
+          }
+        }
+        q += 3;
+      }
+    } else if (type == 5 && len >= 7 && hid_if >= 0 && ep_in == 0) {  // ENDPOINT
       uint8_t bEndpointAddress = p[2];
       bool is_in   = (bEndpointAddress & 0x80) != 0;
       bool is_intr = ((p[3] & 0x03) == 3);
       if (is_in && is_intr) {
-        found_ep_in = bEndpointAddress;
-        found_mps   = (uint16_t)(p[4] | (p[5] << 8));
-        found_itv   = p[6];
+        ep_in   = bEndpointAddress;
+        mps     = (uint16_t)(p[4] | (p[5] << 8));
+        interval= p[6];
       }
     }
     p += len;
   }
 
-  if (hid_if >= 0 && found_ep_in != 0) {
-    if_num   = (uint8_t) hid_if;
-    ep_in    = found_ep_in;
-    mps      = found_mps;
-    interval = found_itv;
+  usb_host_transfer_free(xf);
+
+  if (hid_if >= 0 && ep_in != 0) {
+    if_num    = (uint8_t) hid_if;
+    rdesc_len = hid_rdesc_len;
     ESP_LOGI(TAG, "[cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
              ep_in, (unsigned) mps, (unsigned) interval);
-    usb_host_transfer_free(xf);
     return true;
+  } else {
+    ESP_LOGW(TAG, "[cfg] No se encontró interfaz HID o endpoint IN.");
+    return false;
   }
-
-  ESP_LOGW(TAG, "[cfg] No HID IF o EP IN encontrado");
-  usb_host_transfer_free(xf);
-  return false;
 }
 
 // -----------------------------------------------------
-// Dump del Report Descriptor (GET_DESCRIPTOR(HID_REPORT))
+// Helper: vuelca el Report Descriptor en bloques de 32 bytes
 // -----------------------------------------------------
 bool UpsHid::dump_report_descriptor_chunked_(usb_host_client_handle_t client,
                                              usb_device_handle_t dev_handle,
-                                             uint8_t if_num,
-                                             uint16_t &out_total_len) {
-  out_total_len = 0;
+                                             uint8_t interface_number,
+                                             uint16_t &total_len_logged) {
+  total_len_logged = 0;
   if (!client || !dev_handle) return false;
 
-  // 1) Primero, obtener el tamaño del HID Report Descriptor desde el HID descriptor
-  //    Simplificamos: intentamos leer 512 bytes directamente (muchos UPS HID caben).
-  //    Si es más, lo troceamos igualmente.
-  const int CHUNK = 64;
-  const int MAX_LEN = 1024;
-  uint8_t  tmp[MAX_LEN];
-  int      got = 0;
+  const int CHUNK = 64;  // pedimos de 64 en 64 para no saturar el logger
+  const int MAX_ONELINE = 32;
 
-  // Leemos por bloques con GET_DESCRIPTOR (tipo=0x22) sobre interface (wIndex=if_num)
-  while (got < MAX_LEN) {
-    int req_len = (MAX_LEN - got) > CHUNK ? CHUNK : (MAX_LEN - got);
-    int total   = USB_SETUP_PACKET_SIZE + req_len;
-
+  // Para conocer longitud total, primero pedimos 1 byte y vemos cuánto devuelve el dispositivo;
+  // como ya traemos rdesc_len de la config, esto se usa solo como safety si fuese 0.
+  // Aquí simplemente descargamos hasta que el dispositivo deje de darnos más (o nos cansemos).
+  int offset = 0;
+  for (;;) {
+    int ask = CHUNK;
+    // SETUP: GET_DESCRIPTOR (REPORT=0x22) sobre la interface
+    int tot = USB_SETUP_PACKET_SIZE + ask;
     usb_transfer_t *x = nullptr;
-    if (usb_host_transfer_alloc(total, 0, &x) != ESP_OK) {
+    if (usb_host_transfer_alloc(tot, 0, &x) != ESP_OK) {
       ESP_LOGW(TAG, "[rdesc] alloc failed");
-      break;
+      return (total_len_logged > 0);
     }
-    auto *s = reinterpret_cast<usb_setup_packet_t *>(x->data_buffer);
-    s->bmRequestType = 0x81;            // IN, standard, interface
-    s->bRequest      = 0x06;            // GET_DESCRIPTOR
-    s->wValue        = (uint16_t)((0x22 << 8) | 0x00); // REPORT descriptor
-    s->wIndex        = if_num;
-    s->wLength       = req_len;
 
-    x->num_bytes        = total;
-    x->callback         = ctrl_transfer_cb_;
-    x->context          = nullptr;
-    x->device_handle    = dev_handle;
-    x->bEndpointAddress = 0x00;
-    x->flags            = 0;
+    usb_setup_packet_t *s = reinterpret_cast<usb_setup_packet_t *>(x->data_buffer);
+    s->bmRequestType = 0x81;  // IN, Standard, Interface
+    s->bRequest      = 0x06;  // GET_DESCRIPTOR
+    s->wValue        = static_cast<uint16_t>((0x22 << 8) | 0);  // REPORT descriptor
+    s->wIndex        = interface_number;  // interface #
+    s->wLength       = ask;
+
+    x->num_bytes         = tot;
+    x->callback          = ctrl_transfer_cb_;
+    x->context           = nullptr;
+    x->device_handle     = dev_handle;
+    x->bEndpointAddress  = 0x00;
+    x->flags             = 0;
 
     if (usb_host_transfer_submit_control(client, x) != ESP_OK) {
       ESP_LOGW(TAG, "[rdesc] submit failed");
       usb_host_transfer_free(x);
-      break;
+      return (total_len_logged > 0);
     }
+
     {
-      TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+      TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
       while (xTaskGetTickCount() < dl) {
         (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
-        if (x->status != USB_TRANSFER_STATUS_IDLE) break;
+        // Espera hasta estado terminal
+        if (x->status == USB_TRANSFER_STATUS_COMPLETED ||
+            x->status == USB_TRANSFER_STATUS_ERROR ||
+            x->status == USB_TRANSFER_STATUS_STALL ||
+            x->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+            x->status == USB_TRANSFER_STATUS_CANCELED) {
+          break;
+        }
       }
     }
+
     if (x->status != USB_TRANSFER_STATUS_COMPLETED) {
       usb_host_transfer_free(x);
-      break;
+      break;  // fin
     }
 
-    int got_now = x->actual_num_bytes;
-    if (got_now <= 0) {
+    const uint8_t *d = x->data_buffer + USB_SETUP_PACKET_SIZE;
+    int got = x->actual_num_bytes;
+    if (got <= 0) {
       usb_host_transfer_free(x);
       break;
     }
 
-    // Copia payload (después del setup)
-    int payload = got_now > CHUNK ? CHUNK : got_now;
-    std::memcpy(tmp + got, x->data_buffer + USB_SETUP_PACKET_SIZE, payload);
-    got += payload;
-
-    usb_host_transfer_free(x);
-
-    if (payload < CHUNK) {
-      // Se acabó
-      break;
+    if (offset == 0) {
+      ESP_LOGI(TAG, "[rdesc] len=%d bytes", got);
     }
-  }
 
-  if (got > 0) {
-    out_total_len = (uint16_t) got;
-    ESP_LOGI(TAG, "[rdesc] len=%d bytes", got);
-    // Troceamos para log
-    const int L = 16;
-    for (int i = 0; i < got; i += L) {
-      int n = (i + L <= got) ? L : (got - i);
-      char line[3 * L + 8];
+    // Logueamos en líneas de 16-32 bytes para no bloquear el logger demasiado
+    int idx = 0;
+    while (idx < got) {
+      int n = (got - idx > MAX_ONELINE) ? MAX_ONELINE : (got - idx);
+      char line[3 * MAX_ONELINE + 1];
       int k = 0;
-      for (int j = 0; j < n; j++) {
-        if (k + 4 >= (int)sizeof(line)) break;
-        k += snprintf(line + k, sizeof(line) - k, "%02X%s", tmp[i + j], (j + 1 < n ? " " : ""));
+      for (int i = 0; i < n; i++) {
+        k += snprintf(line + k, sizeof(line) - k, "%02X%s", d[idx + i], (i + 1 < n ? " " : ""));
+        if (k >= (int) sizeof(line)) break;
       }
       ESP_LOGI(TAG, "[rdesc] %s", line);
+      idx += n;
+      total_len_logged += n;
     }
-    return true;
+
+    offset += got;
+    usb_host_transfer_free(x);
+
+    // Si el dispositivo devuelve menos que lo pedido, asumimos fin
+    if (got < ask) break;
+
+    // Seguridad: no volcar infinito
+    if (total_len_logged > 2048) break;
   }
 
-  ESP_LOGW(TAG, "[rdesc] vacío o error");
-  return false;
+  return (total_len_logged > 0);
 }
 
 // -----------------------------------------------------
-// GET_REPORT (Input) por control, report-id
+// Helper: HID GET_REPORT (por control) de tipo INPUT
 // -----------------------------------------------------
 bool UpsHid::hid_get_report_input_ctrl_(usb_host_client_handle_t client,
                                         usb_device_handle_t dev_handle,
                                         uint8_t report_id,
-                                        uint8_t *out_buf, int out_buf_len,
+                                        uint8_t *out_buf,
+                                        int out_buf_len,
                                         int &out_len,
-                                        uint8_t interface_number) {
+                                        uint8_t report_type) {
   out_len = 0;
   if (!client || !dev_handle || !out_buf || out_buf_len <= 0) return false;
 
-  int req = out_buf_len;
-  int total = USB_SETUP_PACKET_SIZE + req;
+  int tot = USB_SETUP_PACKET_SIZE + out_buf_len;
 
   usb_transfer_t *x = nullptr;
-  if (usb_host_transfer_alloc(total, 0, &x) != ESP_OK) {
-    ESP_LOGW(TAG, "[ctrl] alloc failed");
+  if (usb_host_transfer_alloc(tot, 0, &x) != ESP_OK) {
+    ESP_LOGW(TAG, "[poll] alloc failed");
     return false;
   }
-  auto *s = reinterpret_cast<usb_setup_packet_t *>(x->data_buffer);
-  s->bmRequestType = 0xA1;  // IN, class, interface
-  s->bRequest      = 0x01;  // GET_REPORT
-  s->wValue        = (uint16_t)((1 << 8) | report_id); // 1=Input report, low=ID
-  s->wIndex        = interface_number;
-  s->wLength       = req;
 
-  x->num_bytes        = total;
-  x->callback         = ctrl_transfer_cb_;
-  x->context          = nullptr;
-  x->device_handle    = dev_handle;
-  x->bEndpointAddress = 0x00;
-  x->flags            = 0;
+  usb_setup_packet_t *s = reinterpret_cast<usb_setup_packet_t *>(x->data_buffer);
+  s->bmRequestType = 0xA1;  // IN, Class, Interface
+  s->bRequest      = 0x01;  // GET_REPORT
+  s->wValue        = static_cast<uint16_t>(((report_type & 0x03) << 8) | (report_id & 0xFF));
+  s->wIndex        = g_self ? g_self->hid_if_ : 0;  // interface actual
+  s->wLength       = out_buf_len;
+
+  x->num_bytes         = tot;
+  x->callback          = ctrl_transfer_cb_;
+  x->context           = nullptr;
+  x->device_handle     = dev_handle;
+  x->bEndpointAddress  = 0x00;
+  x->flags             = 0;
 
   if (usb_host_transfer_submit_control(client, x) != ESP_OK) {
-    ESP_LOGW(TAG, "[ctrl] submit failed");
+    ESP_LOGW(TAG, "[poll] submit failed");
     usb_host_transfer_free(x);
     return false;
   }
+
   {
-    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+    TickType_t dl = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
     while (xTaskGetTickCount() < dl) {
       (void) usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
-      if (x->status != USB_TRANSFER_STATUS_IDLE) break;
-    }
-  }
-  if (x->status != USB_TRANSFER_STATUS_COMPLETED) {
-    ESP_LOGW(TAG, "[ctrl] status=0x%X", (unsigned) x->status);
-    usb_host_transfer_free(x);
-    return false;
-  }
-
-  int got = x->actual_num_bytes;
-  if (got <= 0) {
-    usb_host_transfer_free(x);
-    return false;
-  }
-
-  // Payload (tras setup)
-  int payload = got > out_buf_len ? out_buf_len : got;
-  std::memcpy(out_buf, x->data_buffer + USB_SETUP_PACKET_SIZE, payload);
-  out_len = payload;
-
-  usb_host_transfer_free(x);
-  return true;
-}
-
-// -----------------------------------------------------
-// Diff de reportes por ID
-// -----------------------------------------------------
-void UpsHid::log_diff_report_(uint8_t rep_id, const uint8_t *data, int len) {
-  if (len <= 0) return;
-
-  // Limitar logs de diff a ~500ms por cortesía
-  uint32_t now_ms = (uint32_t) (esp_log_timestamp() & 0xFFFFFFFFu);
-  const uint32_t DIFF_LOG_MIN_PERIOD_MS = 300; // ajustable
-  if ((now_ms - this->last_diff_log_ms_) < DIFF_LOG_MIN_PERIOD_MS) return;
-  this->last_diff_log_ms_ = now_ms;
-
-  const int MAX_SHOW = 64; // no esperamos más de 64
-  int changed = 0;
-
-  auto print_changes = [&](const uint8_t *oldb, int oldn, bool &have_flag){
-    // compara byte a byte y reporta cambios
-    char line[160];
-    int k = 0;
-    for (int i = 0; i < len && i < MAX_SHOW; i++) {
-      uint8_t prev = (have_flag && i < oldn) ? oldb[i] : 0xFF; // 0xFF -> “sin valor previo”
-      if (!have_flag || prev != data[i]) {
-        if (k < (int)sizeof(line)-1) {
-          int wrote = snprintf(line + k, sizeof(line) - k, "%s[%02d]:%02X->%02X",
-                               (changed==0 ? "" : " "),
-                               i, (have_flag ? prev : 0xFF), data[i]);
-          if (wrote > 0) k += wrote;
-          changed++;
-        }
+      // Espera hasta estado terminal
+      if (x->status == USB_TRANSFER_STATUS_COMPLETED ||
+          x->status == USB_TRANSFER_STATUS_ERROR ||
+          x->status == USB_TRANSFER_STATUS_STALL ||
+          x->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+          x->status == USB_TRANSFER_STATUS_CANCELED) {
+        break;
       }
     }
-    if (changed > 0) {
-      ESP_LOGI(TAG, "[diff] rep=0x%02X %s", rep_id, line);
-    }
-  };
+  }
 
-  switch (rep_id) {
-    case 0x01: {
-      print_changes(this->last_rep_01_, this->last_rep_01_len_, this->have_last_01_);
-      std::memcpy(this->last_rep_01_, data, len);
-      this->last_rep_01_len_ = len;
-      this->have_last_01_ = true;
-      break;
-    }
-    case 0x64: {
-      print_changes(this->last_rep_64_, this->last_rep_64_len_, this->have_last_64_);
-      std::memcpy(this->last_rep_64_, data, len);
-      this->last_rep_64_len_ = len;
-      this->have_last_64_ = true;
-      break;
-    }
-    case 0x66: {
-      print_changes(this->last_rep_66_, this->last_rep_66_len_, this->have_last_66_);
-      std::memcpy(this->last_rep_66_, data, len);
-      this->last_rep_66_len_ = len;
-      this->have_last_66_ = true;
-      break;
-    }
-    default: {
-      // Para otros IDs, solo log corto
-      log_hex_prefix_("[poll] (other id) GET_REPORT", data, len, 32);
-      break;
+  bool ok = false;
+  if (x->status == USB_TRANSFER_STATUS_COMPLETED) {
+    int got = x->actual_num_bytes;
+    if (got > 0) {
+      const uint8_t *d = x->data_buffer + USB_SETUP_PACKET_SIZE;
+      int n = (got > out_buf_len) ? out_buf_len : got;
+      memcpy(out_buf, d, n);
+      out_len = n;
+      ok = true;
     }
   }
+  usb_host_transfer_free(x);
+  return ok;
 }
 
 // =====================================================
@@ -428,44 +383,57 @@ void UpsHid::log_diff_report_(uint8_t rep_id, const uint8_t *data, int len) {
 // =====================================================
 
 void UpsHid::setup() {
-  // 1) Instalar host
+  // 1) Instalar librería USB Host
   usb_host_config_t cfg = {.skip_phy_setup = false, .intr_flags = 0};
   esp_err_t err = usb_host_install(&cfg);
-  if (err != ESP_OK) {
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "USB Host Library installed.");
+  } else {
     ESP_LOGE(TAG, "usb_host_install() failed: 0x%X", (unsigned) err);
     return;
   }
-  ESP_LOGI(TAG, "USB Host Library installed.");
 
-  // 2) Daemon task
+  // 2) Tarea daemon de la librería
   xTaskCreatePinnedToCore(UpsHid::host_daemon_task_, "usbh_daemon",
                           4096, nullptr, 5, nullptr, tskNO_AFFINITY);
 
-  // 3) Cliente async
-  usb_host_client_config_t ccfg = {};
-  ccfg.is_synchronous    = false;
-  ccfg.max_num_event_msg = 8;
-  ccfg.async.client_event_callback = UpsHid::client_callback_;
-  ccfg.async.callback_arg = this;
-
-  err = usb_host_client_register(&ccfg, &this->client_);
-  if (err != ESP_OK) {
+  // 3) Registrar cliente asíncrono con callback
+  usb_host_client_config_t client_cfg = {
+      .is_synchronous = false,
+      .max_num_event_msg = 8,
+      .async = {
+          .client_event_callback = UpsHid::client_callback_,
+          .callback_arg = this,
+      },
+  };
+  err = usb_host_client_register(&client_cfg, &this->client_);
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "USB Host client registered.");
+    // 4) Tarea que despacha eventos + polling
+    xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client",
+                            4096, this, 5, nullptr, tskNO_AFFINITY);
+  } else {
     ESP_LOGE(TAG, "usb_host_client_register() failed: 0x%X", (unsigned) err);
     return;
   }
-  ESP_LOGI(TAG, "USB Host client registered.");
 
-  // 4) Task del cliente
-  xTaskCreatePinnedToCore(UpsHid::client_task_, "usbh_client",
-                          4096, this, 5, nullptr, tskNO_AFFINITY);
+  g_self = this;
 }
 
 void UpsHid::dump_config() {
-  ESP_LOGCONFIG(TAG, "UPS HID component ready.");
+  ESP_LOGCONFIG(TAG, "UPS HID component is configured.");
+}
+
+void UpsHid::update() {
+  // No hacemos nada periódico aquí; el polling se hace en client_task_.
+  if (!this->hello_logged_) {
+    ESP_LOGI(TAG, "UPS HID component ready.");
+    this->hello_logged_ = true;
+  }
 }
 
 // =====================================================
-// Tareas / Callback
+// Funciones estáticas (tareas/callback)
 // =====================================================
 
 void UpsHid::host_daemon_task_(void *arg) {
@@ -477,7 +445,9 @@ void UpsHid::host_daemon_task_(void *arg) {
         ESP_LOGI(TAG, "[usbh_daemon] USB Host event flags: 0x%08X", (unsigned) flags);
         flags = 0;
       }
-    } else if (err != ESP_ERR_TIMEOUT) {
+    } else if (err == ESP_ERR_TIMEOUT) {
+      // sin eventos
+    } else {
       ESP_LOGW(TAG, "[usbh_daemon] handle_events err=0x%X", (unsigned) err);
     }
   }
@@ -491,7 +461,7 @@ void UpsHid::client_task_(void *arg) {
     return;
   }
 
-  uint8_t  if_num = 0xFF, ep = 0; uint16_t mps = 0; uint8_t itv = 0; uint16_t cfg_len = 0;
+  TickType_t last_poll = xTaskGetTickCount();
 
   while (true) {
     esp_err_t err = usb_host_client_handle_events(self->client_, pdMS_TO_TICKS(100));
@@ -499,48 +469,54 @@ void UpsHid::client_task_(void *arg) {
       ESP_LOGW(TAG, "[usbh_client] handle_events err=0x%X", (unsigned) err);
     }
 
-    if (UpsHid::g_probe_pending_ && self->dev_handle_ != nullptr) {
+    // 1) Descubrimiento HID (fuera del callback)
+    if (g_probe_pending && self->dev_handle_ != nullptr) {
+      uint8_t if_num, ep; uint16_t mps; uint8_t itv; uint16_t rdlen;
       if (read_config_descriptor_and_log_hid_(self->client_, self->dev_handle_,
-                                              if_num, ep, mps, itv, cfg_len)) {
-        self->hid_if_        = if_num;
-        self->hid_ep_in_     = ep;
-        self->hid_ep_mps_    = mps;
-        self->hid_ep_interval_ = itv;
+                                              if_num, ep, mps, itv, rdlen)) {
+        self->hid_if_         = if_num;
+        self->hid_ep_in_      = ep;
+        self->hid_ep_mps_     = mps;
+        self->hid_ep_interval_= itv;
+
         ESP_LOGI(TAG, "[cfg] ready: IF=%u EP=0x%02X MPS=%u interval=%u",
                  (unsigned) self->hid_if_, (unsigned) self->hid_ep_in_,
                  (unsigned) self->hid_ep_mps_, (unsigned) self->hid_ep_interval_);
 
-        // dump report descriptor (troceado)
-        uint16_t rdlen = 0;
-        (void) dump_report_descriptor_chunked_(self->client_, self->dev_handle_,
-                                               self->hid_if_, rdlen);
-
-        UpsHid::g_polling_enabled_ = true;  // habilitamos polling control GET_REPORT
+        // Volcar Report Descriptor (troceado)
+        uint16_t dumped = 0;
+        (void) dump_report_descriptor_chunked_(self->client_, self->dev_handle_, self->hid_if_, dumped);
       }
-      UpsHid::g_probe_pending_ = false;
+      g_probe_pending = false;
     }
 
-    // Polling simple por control GET_REPORT de los IDs vistos en tus logs
-    if (UpsHid::g_polling_enabled_ && self->dev_handle_ != nullptr && self->hid_if_ != 0xFF) {
-      const uint8_t ids[] = {0x01, 0x64, 0x66};
-      uint8_t buf[UpsHid::MAX_REPORT_LEN];
-      int     got = 0;
+    // 2) Polling por control GET_REPORT (cada ~1000 ms)
+    TickType_t now = xTaskGetTickCount();
+    if (self->dev_handle_ != nullptr &&
+        self->hid_if_ != 0xFF &&
+        (now - last_poll) >= pdMS_TO_TICKS(1000)) {
+      last_poll = now;
 
-      for (uint8_t rid : ids) {
+      uint8_t buf[64];
+      int outlen = 0;
+
+      // ids que ya viste responder: 0x01, 0x64, 0x66
+      const uint8_t report_ids[] = {0x01, 0x64, 0x66};
+      for (uint8_t rid : report_ids) {
         if (hid_get_report_input_ctrl_(self->client_, self->dev_handle_, rid,
-                                       buf, sizeof(buf), got, self->hid_if_)) {
-          // Primer byte suele ser ReportID; si no, lo tratamos igual
-          if (got > 0) {
-            // Log corta + diff
-            // self->log_hex_prefix_("[poll] GET_REPORT", buf, got, 32);
-            self->log_diff_report_(rid, buf, got);
+                                       buf, sizeof(buf), outlen, 0x01 /*Input*/)) {
+          // Log breve en hex
+          int max_log = (outlen > 64) ? 64 : outlen;
+          char line[3 * 64 + 1];
+          int k = 0;
+          for (int i = 0; i < max_log; i++) {
+            k += snprintf(line + k, sizeof(line) - k, "%02X%s", buf[i], (i + 1 < max_log ? " " : ""));
+            if (k >= (int) sizeof(line)) break;
           }
+          ESP_LOGI(TAG, "[poll] GET_REPORT id=0x%02X len=%d data=%s%s",
+                   rid, outlen, line, (outlen > max_log ? " ..." : ""));
         }
-        // spacing pequeño entre ids para no acribillar el bus
-        vTaskDelay(pdMS_TO_TICKS(10));
       }
-      // periodo total de ~1s entre rondas
-      vTaskDelay(pdMS_TO_TICKS(900));
     }
   }
 }
@@ -551,11 +527,13 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
 
   switch (msg->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV: {
+      // Abrir el dispositivo y guardar addr/handle
       esp_err_t e = usb_host_device_open(self->client_, msg->new_dev.address, &self->dev_handle_);
       if (e == ESP_OK) {
         self->dev_addr_ = msg->new_dev.address;
         ESP_LOGI(TAG, "[attach] NEW_DEV addr=%u (opened)", (unsigned) self->dev_addr_);
-        UpsHid::g_probe_pending_ = true;
+        // lanzamos descubrimiento fuera del callback
+        g_probe_pending = true;
       } else {
         ESP_LOGW(TAG, "[attach] NEW_DEV addr=%u but open failed: 0x%X",
                  (unsigned) msg->new_dev.address, (unsigned) e);
@@ -563,21 +541,24 @@ void UpsHid::client_callback_(const usb_host_client_event_msg_t *msg, void *arg)
       break;
     }
     case USB_HOST_CLIENT_EVENT_DEV_GONE: {
-      UpsHid::g_polling_enabled_ = false;
+      // Parar lectura si estaba activa
+      self->listening_ = false;
+
+      if (self->in_xfer_) {
+        // Si alguna vez armamos IN por interrupt, la liberaríamos fuera del ISR
+        usb_host_transfer_free(self->in_xfer_);
+        self->in_xfer_ = nullptr;
+      }
 
       if (self->dev_handle_ != nullptr) {
         usb_host_device_close(self->client_, self->dev_handle_);
         self->dev_handle_ = nullptr;
       }
-
-      self->dev_addr_ = 0;
-      self->hid_if_   = 0xFF;
-      self->hid_ep_in_ = 0;
-      self->hid_ep_mps_ = 0;
-      self->hid_ep_interval_ = 0;
-
-      self->have_last_01_ = self->have_last_64_ = self->have_last_66_ = false;
-      self->last_rep_01_len_ = self->last_rep_64_len_ = self->last_rep_66_len_ = 0;
+      self->dev_addr_       = 0;
+      self->hid_if_         = 0xFF;
+      self->hid_ep_in_      = 0;
+      self->hid_ep_mps_     = 0;
+      self->hid_ep_interval_= 0;
 
       ESP_LOGI(TAG, "[detach] DEV_GONE");
       break;
