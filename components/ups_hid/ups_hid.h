@@ -3,43 +3,27 @@
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
 
-#include <vector>
-#include <map>
-#include <array>
-#include <cstring>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
-// ESP-IDF USB Host
-#include "usb/usb_host.h"
-#include "usb/usb_helpers.h"
-#include "usb/usb_types_ch9.h"
+#include <usb/usb_host.h>
+#include <usb/usb_types_ch9.h>
 
 namespace esphome {
 namespace ups_hid {
 
-static const char *const TAG = "ups_hid";
-
 class UpsHid : public PollingComponent {
  public:
-  UpsHid();
-
   void setup() override;
   void dump_config() override;
-  void update() override;
+  void update() override;  // PollingComponent pide este método; aquí no hacemos nada pesado
 
  private:
   // Tareas
-  static void daemon_task_(void *param);
-  static void client_task_(void *param);
+  static void daemon_task_(void *arg);
+  static void client_task_(void *arg);
 
-  // Helpers HID
-  static bool read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
-                                                  usb_device_handle_t devh,
-                                                  uint8_t &hid_if,
-                                                  uint8_t &ep_in,
-                                                  uint16_t &mps_in,
-                                                  uint8_t &poll_interval_ms,
-                                                  uint16_t &rdesc_len);
-
+  // Helpers de control transfer
   static bool dump_report_descriptor_chunked_(usb_host_client_handle_t client,
                                               usb_device_handle_t devh,
                                               uint8_t hid_if,
@@ -53,13 +37,8 @@ class UpsHid : public PollingComponent {
                                          int &out_len,
                                          uint8_t hid_if);
 
-  void log_report_diff_(uint8_t report_id, const uint8_t *data, int len);
-
-  static TaskHandle_t daemon_task_handle_;
-  static TaskHandle_t client_task_handle_;
-  static bool host_started_;
-
-  std::map<uint8_t, std::vector<uint8_t>> last_report_by_id_;
+  // Utilidades
+  static const char *xfer_status_str(usb_transfer_status_t st);
 };
 
 }  // namespace ups_hid
