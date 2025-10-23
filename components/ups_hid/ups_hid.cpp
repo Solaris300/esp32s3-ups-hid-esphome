@@ -19,11 +19,9 @@ bool UpsHid::host_started_{false};
 UpsHid::UpsHid() : PollingComponent(1000) {}  // 1s por defecto
 
 void UpsHid::setup() {
-  // Arrancamos el host una sola vez
   if (!host_started_) {
-    usb_host_config_t cfg = {
-        .intr_flags = 0,
-    };
+    usb_host_config_t cfg = {};
+    cfg.intr_flags = 0;
     esp_err_t err = usb_host_install(&cfg);
     if (err == ESP_OK) {
       host_started_ = true;
@@ -41,33 +39,16 @@ void UpsHid::dump_config() {
 }
 
 void UpsHid::update() {
-  // No hacemos nada aquí: todo va en la tarea cliente con su propio ritmo.
+  // Todo el trabajo lo hace la tarea cliente.
 }
 
-// ===================== UTILIDADES =====================
-
-static const char *xfer_status_str(usb_transfer_status_t st) {
-  switch (st) {
-    case USB_TRANSFER_STATUS_COMPLETED: return "COMPLETED";
-    case USB_TRANSFER_STATUS_NO_DEVICE: return "NO_DEVICE";
-    case USB_TRANSFER_STATUS_ERROR:     return "ERROR";
-    case USB_TRANSFER_STATUS_STALL:     return "STALL";
-    case USB_TRANSFER_STATUS_BUSY:      return "BUSY";
-    case USB_TRANSFER_STATUS_CANCELED:  return "CANCELED";
-    default:                            return "UNKNOWN";
-  }
-}
-
-// ====== Diff Logger ======
+// ----------------- Diff logger -----------------
 void UpsHid::log_report_diff_(uint8_t report_id, const uint8_t *data, int len) {
   auto &prev = last_report_by_id_[report_id];
 
-  // Si nunca hemos visto este ID, lo guardamos y volcamos la línea completa como antes
   if (prev.empty()) {
     prev.assign(data, data + len);
-
-    // Línea clásica (completa) para el primer reporte de cada ID
-    // Para no inundar, imprimimos en bloques de 32 bytes
+    // Primera vez: volcamos completo en bloques de 32 bytes
     char line[256];
     int off = 0;
     while (off < len) {
@@ -84,8 +65,6 @@ void UpsHid::log_report_diff_(uint8_t report_id, const uint8_t *data, int len) {
     return;
   }
 
-  // Compara y construye una cadena compacta marcando diferencias
-  // Formato: “idx: old->new”
   char buf[512];
   int pos = snprintf(buf, sizeof(buf), "[poll] DIFF id=0x%02X changed:", report_id);
   bool any = false;
@@ -98,22 +77,22 @@ void UpsHid::log_report_diff_(uint8_t report_id, const uint8_t *data, int len) {
       if (pos > (int) sizeof(buf) - 16) break;
     }
   }
-  if (len != (int) prev.size()) {
+  if ((size_t) len != prev.size()) {
     any = true;
     pos += snprintf(buf + pos, sizeof(buf) - pos, " (len %zu->%d)", prev.size(), len);
   }
 
   if (any) {
     ESP_LOGI(TAG, "%s", buf);
-    // Guardamos la nueva referencia
     prev.assign(data, data + len);
   } else {
-    // Nada cambió; para que sepas que hubo lectura pero igual a la previa:
     ESP_LOGV(TAG, "[poll] DIFF id=0x%02X no changes", report_id);
   }
 }
 
-// ====== Lectura de configuración / HID ======
+// ----------------- HID helpers -----------------
+
+static inline uint16_t rd16(const uint8_t *p) { return (uint16_t) p[0] | ((uint16_t) p[1] << 8); }
 
 bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client,
                                                  usb_device_handle_t devh,
@@ -135,45 +114,40 @@ bool UpsHid::read_config_descriptor_and_log_hid_(usb_host_client_handle_t client
     return false;
   }
 
-  hid_if = 0xFF;
-  ep_in = 0;
-  mps_in = 0;
-  poll_interval_ms = 0;
-  rdesc_len = 0;
+  hid_if = 0xFF; ep_in = 0; mps_in = 0; poll_interval_ms = 0; rdesc_len = 0;
 
   const uint8_t *p = (const uint8_t *) cfg;
   const uint8_t *end = p + cfg->wTotalLength;
 
-  while (p + sizeof(usb_desc_hdr_t) <= end) {
-    auto *hdr = (const usb_desc_hdr_t *) p;
-    if (hdr->bLength == 0) break;
+  while (p + 2 <= end) {
+    uint8_t bLength = p[0];
+    uint8_t bDescriptorType = p[1];
+    if (bLength == 0) break;
+    if (p + bLength > end) break;
 
-    if (hdr->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+    if (bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE && bLength >= sizeof(usb_intf_desc_t)) {
       auto *ifd = (const usb_intf_desc_t *) p;
-      if (ifd->bInterfaceClass == USB_CLASS_HID && ifd->bInterfaceSubClass == 0x01 /*Boot*/ && ifd->bInterfaceProtocol == 0x00 /*None*/) {
+      if (ifd->bInterfaceClass == USB_CLASS_HID) {
         hid_if = ifd->bInterfaceNumber;
         ESP_LOGI(TAG, "[usbh_client]: [cfg] HID IF=%u class=0x%02X sub=0x%02X proto=0x%02X",
                  (unsigned) ifd->bInterfaceNumber, ifd->bInterfaceClass, ifd->bInterfaceSubClass, ifd->bInterfaceProtocol);
       }
-    } else if (hdr->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+    } else if (bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT && bLength >= sizeof(usb_ep_desc_t)) {
       auto *ep = (const usb_ep_desc_t *) p;
-      if ((ep->bEndpointAddress & USB_B_ENDPOINT_ADDRESS_EP_DIR_MASK) == USB_B_ENDPOINT_ADDRESS_EP_DIR_IN) {
+      if (ep->bEndpointAddress & 0x80) {  // IN
         ep_in = ep->bEndpointAddress;
         mps_in = ep->wMaxPacketSize;
         poll_interval_ms = ep->bInterval;
         ESP_LOGI(TAG, "[usbh_client]: [cfg] HID endpoint IN=0x%02X MPS=%u interval=%u ms",
                  ep_in, (unsigned) mps_in, (unsigned) poll_interval_ms);
       }
-    } else if (hdr->bDescriptorType == USB_B_DESCRIPTOR_TYPE_HID) {
-      // HID descriptor (para longitud de Report Descriptor)
-      if (hdr->bLength >= 9) {
-        // bLength 9, bytes 7..8 => wDescriptorLength
-        rdesc_len = *((uint16_t *)(p + 7));
-        ESP_LOGI(TAG, "[usbh_client]: [cfg] Report Descriptor length=%u bytes", (unsigned) rdesc_len);
-      }
+    } else if (bDescriptorType == 0x21 /* HID */ && bLength >= 9) {
+      // HID descriptor: wDescriptorLength en bytes 7..8
+      rdesc_len = rd16(p + 7);
+      ESP_LOGI(TAG, "[usbh_client]: [cfg] Report Descriptor length=%u bytes", (unsigned) rdesc_len);
     }
 
-    p += hdr->bLength;
+    p += bLength;
   }
 
   if (hid_if == 0xFF || ep_in == 0) {
@@ -192,52 +166,52 @@ bool UpsHid::dump_report_descriptor_chunked_(usb_host_client_handle_t client,
                                              uint16_t &total_logged) {
   total_logged = 0;
 
-  // GET_DESCRIPTOR (Report)
   const int CHUNK = 32;
-  std::vector<uint8_t> tmp(CHUNK);
 
-  // Vamos leyendo en tramos con control transfer
-  // Nota: algunos dispositivos aceptan offset en wValue / wIndex combinando,
-  // aquí hacemos intentos consecutivos hasta que falle por STALL/NO_DEVICE.
-  for (int off = 0; off < 2048; off += CHUNK) {
+  for (int /*off*/ = 0; off < 2048; off += CHUNK) {
     usb_setup_packet_t setup = {};
     setup.bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
     setup.bRequest = USB_B_REQUEST_GET_DESCRIPTOR;
-    // HID Report descriptor = (HID_REPORT << 8) | 0
-    setup.wValue = (0x22 << 8) | 0x00;
+    setup.wValue = (0x22 << 8) | 0x00;  // Report descriptor
     setup.wIndex = hid_if;
     setup.wLength = CHUNK;
 
     usb_transfer_t *xfer = nullptr;
     if (usb_host_transfer_alloc(CHUNK, 0, &xfer) != ESP_OK) break;
+
     memcpy(xfer->data_buffer, &setup, sizeof(setup));
     xfer->num_bytes = sizeof(setup);
+    xfer->device_handle = devh;
     xfer->callback = nullptr;
-    xfer->context  = nullptr;
+    xfer->context = nullptr;
 
-    esp_err_t err = usb_host_transfer_submit_control(devh, xfer);
-    if (err != ESP_OK) {
-      usb_host_transfer_free(xfer);
-      break;
-    }
-    // Espera activa simple
-    while (xfer->status == USB_TRANSFER_STATUS_BUSY) { vTaskDelay(pdMS_TO_TICKS(1)); }
-
-    if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-      // Terminamos cuando ya no hay más (algunos controladores devuelven STALL al sobre-pedir)
+    if (usb_host_transfer_submit_control(client, xfer) != ESP_OK) {
       usb_host_transfer_free(xfer);
       break;
     }
 
+    // Espera por eventos hasta 100 ms aprox.
+    bool done = false;
+    for (int i = 0; i < 20; i++) {
+      usb_host_client_handle_events(client, 5);
+      if (xfer->actual_num_bytes > 0 || xfer->status == USB_TRANSFER_STATUS_COMPLETED ||
+          xfer->status == USB_TRANSFER_STATUS_STALL || xfer->status == USB_TRANSFER_STATUS_ERROR ||
+          xfer->status == USB_TRANSFER_STATUS_NO_DEVICE || xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+        done = true;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
     int got = xfer->actual_num_bytes;
-    if (got <= 0) {
+
+    if (!done || got <= 0) {
       usb_host_transfer_free(xfer);
       break;
     }
 
-    // Logueamos en líneas de 16 bytes
-    if (off == 0) {
-      ESP_LOGI(TAG, "[usbh_client]: [rdesc] len (chunked) ~>= %d bytes", got * 4); // aproximado para avisarte
+    // Log en líneas de 16 bytes
+    if (total_logged == 0) {
+      ESP_LOGI(TAG, "[usbh_client]: [rdesc] len (chunked) ~>= %d bytes", got * 4);
     }
     int ptr = 0;
     while (ptr < got) {
@@ -251,13 +225,12 @@ bool UpsHid::dump_report_descriptor_chunked_(usb_host_client_handle_t client,
 
     total_logged += got;
     usb_host_transfer_free(xfer);
-
-    // Evita bloquear demasiado el logger
     vTaskDelay(pdMS_TO_TICKS(1));
-    if (got < CHUNK) break;  // última porción
+    if (got < CHUNK) break;
   }
 
-  ESP_LOGI(TAG, "[usbh_client]: [rdesc] len=%u bytes", (unsigned) total_logged * 2);
+  // Damos una cifra indicativa (algunos firmwares “repiten” bloques)
+  ESP_LOGI(TAG, "[usbh_client]: [rdesc] len~=%u bytes", (unsigned) total_logged);
   return (total_logged > 0);
 }
 
@@ -270,7 +243,6 @@ bool UpsHid::hid_get_report_input_ctrl_(usb_host_client_handle_t client,
                                         uint8_t hid_if) {
   out_len = 0;
 
-  // HID GET_REPORT(Input)
   usb_setup_packet_t setup = {};
   setup.bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
   setup.bRequest = 0x01; // GET_REPORT
@@ -282,37 +254,46 @@ bool UpsHid::hid_get_report_input_ctrl_(usb_host_client_handle_t client,
   if (usb_host_transfer_alloc(buf_len, 0, &xfer) != ESP_OK) {
     return false;
   }
-  // Cargar setup packet en el buffer interno
   memcpy(xfer->data_buffer, &setup, sizeof(setup));
   xfer->num_bytes = sizeof(setup);
+  xfer->device_handle = devh;
+  xfer->callback = nullptr;
+  xfer->context = nullptr;
 
-  esp_err_t err = usb_host_transfer_submit_control(devh, xfer);
-  if (err != ESP_OK) {
+  if (usb_host_transfer_submit_control(client, xfer) != ESP_OK) {
     usb_host_transfer_free(xfer);
     return false;
   }
 
-  while (xfer->status == USB_TRANSFER_STATUS_BUSY) { vTaskDelay(pdMS_TO_TICKS(1)); }
+  bool done = false;
+  for (int i = 0; i < 40; i++) {  // hasta ~200 ms
+    usb_host_client_handle_events(client, 5);
+    if (xfer->actual_num_bytes > 0 || xfer->status == USB_TRANSFER_STATUS_COMPLETED ||
+        xfer->status == USB_TRANSFER_STATUS_STALL || xfer->status == USB_TRANSFER_STATUS_ERROR ||
+        xfer->status == USB_TRANSFER_STATUS_NO_DEVICE || xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+      done = true;
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
 
-  bool ok = (xfer->status == USB_TRANSFER_STATUS_COMPLETED);
+  bool ok = (done && (xfer->status == USB_TRANSFER_STATUS_COMPLETED) && xfer->actual_num_bytes > 0);
   if (ok) {
-    // El payload llega en xfer->data_buffer (después del setup), pero
-    // usb_host_transfer de IDF ya nos deja el “actual_num_bytes”
     int n = xfer->actual_num_bytes;
     if (n > buf_len) n = buf_len;
-    if (n > 0) {
-      memcpy(buf, xfer->data_buffer, n);
-      out_len = n;
-    }
+    memcpy(buf, xfer->data_buffer, n);
+    out_len = n;
   } else {
-    ESP_LOGW(TAG, "[poll] GET_REPORT id=0x%02X status=%s", report_id, xfer_status_str(xfer->status));
+    // Log corto del fallo
+    ESP_LOGW(TAG, "[poll] GET_REPORT id=0x%02X status=%d bytes=%d",
+             report_id, (int) xfer->status, (int) xfer->actual_num_bytes);
   }
 
   usb_host_transfer_free(xfer);
   return ok;
 }
 
-// ====== Tareas ======
+// ----------------- Tareas -----------------
 
 void UpsHid::daemon_task_(void *param) {
   ESP_LOGI(TAG, "[usbh_daemon] USB Host daemon started");
@@ -336,7 +317,8 @@ void UpsHid::client_task_(void *param) {
   usb_host_client_config_t client_cfg = {};
   client_cfg.is_synchronous = false;
   client_cfg.max_num_event_msg = 5;
-  client_cfg.async = { .client_event_callback = nullptr, .callback_arg = nullptr };
+  client_cfg.async.client_event_callback = nullptr;
+  client_cfg.async.callback_arg = nullptr;
 
   if (usb_host_client_register(&client_cfg, &client) != ESP_OK) {
     ESP_LOGE(TAG, "[usbh_client] register failed");
@@ -345,11 +327,15 @@ void UpsHid::client_task_(void *param) {
   }
 
   while (true) {
-    usb_host_dev_hdl_t devh = nullptr;
-    usb_host_client_handle_events(client, 1000);
+    usb_host_client_handle_events(client, 100);
 
-    // Espera a que haya un dispositivo (bloqueante de cortesía)
-    if (usb_host_device_open(client, 1 /* address autodetect not provided here */, &devh) != ESP_OK) {
+    // Intentamos abrir el device addr 1 (tu caso) y, si no, probamos 2..5
+    usb_device_handle_t devh = nullptr;
+    bool opened = false;
+    for (int addr = 1; addr <= 5; addr++) {
+      if (usb_host_device_open(client, addr, &devh) == ESP_OK) { opened = true; break; }
+    }
+    if (!opened) {
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
     }
@@ -363,13 +349,12 @@ void UpsHid::client_task_(void *param) {
       continue;
     }
 
-    // Intenta volcar (troceado) el Report Descriptor para no saturar logger
     uint16_t logged = 0;
     dump_report_descriptor_chunked_(client, devh, hid_if, logged);
 
-    // ===== Bucle de “poll” con GET_REPORT por IDs conocidos =====
     const uint8_t report_ids[] = {0x01, 0x64, 0x66};
     std::array<uint8_t, 64> buf{};
+
     for (;;) {
       bool still_ok = true;
       for (uint8_t rid : report_ids) {
@@ -378,19 +363,15 @@ void UpsHid::client_task_(void *param) {
           still_ok = false;
           break;
         }
-        if (out_len > 0) {
-          // <<<— AQUÍ el nuevo logger “diff” —>>>
-          self->log_report_diff_(rid, buf.data(), out_len);
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));  // pequeño respiro entre IDs
+        if (out_len > 0) self->log_report_diff_(rid, buf.data(), out_len);
+        vTaskDelay(pdMS_TO_TICKS(5));
       }
       if (!still_ok) break;
-      vTaskDelay(pdMS_TO_TICKS(1000)); // ritmo ~1s total, similar a tus logs
+      vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     ESP_LOGI(TAG, "[usbh_client]: [detach] DEV_GONE");
     usb_host_device_close(client, devh);
-    // Limpia referencias “diff” para no mezclar sesiones
     self->last_report_by_id_.clear();
   }
 }
