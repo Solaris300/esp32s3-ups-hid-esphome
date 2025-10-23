@@ -52,22 +52,7 @@ class UpsHid : public PollingComponent {
   // Opcional: armazón de decodificador mínimo
   static void parse_report_minimal_(uint8_t report_id, const uint8_t *d, int n);
 
-  // --- Diff helper state ---
-  // Índices monitorizados: 0->RID 0x01, 1->RID 0x64, 2->RID 0x66
-  uint8_t prev_report_[3][64] = {0};
-  bool prev_valid_[3] = {false, false, false};
-
-  int rid_index_(uint8_t rid) {
-    if (rid == 0x01) return 0;
-    if (rid == 0x64) return 1;
-    if (rid == 0x66) return 2;
-    return -1;
-  }
-
-  void log_report_diff_(uint8_t rid, const uint8_t *buf, int len);
-
-
-
+ 
  private:
   bool hello_logged_{false};
 
